@@ -133,15 +133,16 @@ def search_data(query: str, categories: list[str] | None = None,
     탐색 요령:
     - 한 단어로 시작해서 결과에 나온 키워드로 넓혀갈 것 (예: 통학 → 셔틀 → 환승 → 정류장).
     - 결과가 많으면 categories로 좁히기. 가능한 값: 국토도시, 주택토지, 교통물류, 항공, 도로철도, 일반, 융합(기타)
-    - data_types로 종류를 고를 수 있음: dataset(데이터셋), dataservice(데이터서비스). 비우면 전부.
+    - data_types: dataset(데이터셋), dataservice(데이터서비스). 비우면 이 둘만 검색.
+      지난 공모전·분석과제 출품작까지 보려면 ["all"] (어떤 데이터가 어떤 아이디어에 쓰였는지 참고용).
     - total이 perPage보다 크면 page를 올려 더 볼 수 있음.
     """
     params = {"page": page, "perPage": 20, "searchQuery": query}
     cats = [c for c in (categories or []) if c in CATEGORIES]
     if cats:
         params["categoryNames"] = ",".join(cats)
-    types = [t for t in (data_types or []) if t in DATA_TYPES]
-    if types:
+    if "all" not in (data_types or []):
+        types = [t for t in (data_types or []) if t in DATA_TYPES] or DATA_TYPES
         params["dataTypes"] = ",".join(types)
     data = _call(SEARCH_URL, params)
     return {
@@ -172,8 +173,9 @@ def get_dataset(title: str = "", creator: str = "", page: int = 1) -> dict:
     - search_data로 찾은 데이터가 쓸 만해 보일 때, 그 제목으로 상세 확인.
     - 두 데이터를 엮을 수 있는지 볼 때, 기간(period)이 겹치는지 확인.
     - 공모전 제출용이면 license(이용허락범위)도 확인.
-    title·creator 중 하나 이상 넣을 것. 부분 일치로 찾힘.
-    국토부 서버가 creator 조건을 제대로 거르지 않아서, 제공·관리기관에 creator가 없는 결과는 여기서 뺀다.
+    title로 찾을 것. 부분 일치로 찾힘.
+    creator(제공기관)는 국토부 서버가 제대로 거르지 않아 대부분 0건이 됨(맞지 않는 결과는 여기서 뺌).
+    특정 기관 데이터를 찾으려면: search_data로 검색 → 결과의 agency로 기관 확인 → 그 title로 이 도구 호출.
     """
     params = {"page": page, "perPage": 20}
     if title:
