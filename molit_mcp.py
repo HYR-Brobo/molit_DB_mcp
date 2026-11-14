@@ -111,6 +111,12 @@ def _total(data: dict):
     return None
 
 
+def _period(ds: dict) -> str:
+    """기간이 없으면 'None ~ None' 대신 빈 문자열."""
+    start, end = ds.get("temporalStartDate") or "", ds.get("temporalEndDate") or ""
+    return f"{start} ~ {end}" if (start or end) else ""
+
+
 def _short(text, n=300):
     text = (text or "").strip().replace("\n", " ")
     return text if len(text) <= n else text[:n] + "…"
@@ -177,7 +183,7 @@ def get_dataset(title: str = "", creator: str = "", page: int = 1) -> dict:
                 "publisher": ds.get("publisherNm"),
                 "keywords": ds.get("keyword"),
                 "description": _short(ds.get("description"), 500),
-                "period": f"{ds.get('temporalStartDate', '')} ~ {ds.get('temporalEndDate', '')}",
+                "period": _period(ds),
                 "license": ds.get("license"),
                 "access": ds.get("accessRights"),
                 "page_url": ds.get("landingPage"),
