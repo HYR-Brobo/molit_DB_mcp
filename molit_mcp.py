@@ -16,7 +16,8 @@ try:                                            # mcp 2.x
 except ImportError:                             # mcp 1.x
     from mcp.server.fastmcp import FastMCP as Server
 
-HOST = "openapi.molit.go.kr"
+# openapi.molit.go.kr은 DNS가 127.0.0.1을 돌려줘서 어디서든 접속 거부됨. 실제 API는 여기.
+HOST = "data.molit.go.kr"
 PATH = "/api/openapi"
 SEARCH_URL = "/search/getOpenApiSearchList"
 DATASET_URL = "/dataset/getOpenApiDatasetList"
@@ -61,6 +62,14 @@ def _call(path: str, params: dict) -> dict:
             data = r.json()
         except ValueError:
             raise RuntimeError(f"{scheme} 응답이 JSON이 아님: {_mask(r.text[:300])}")
+        err = data.get("error") if isinstance(data, dict) else None
+        if err:
+            # 서버는 오류를 {"error": {...}} 모양으로 보냄 (예: ERROR-30 등록되지 않은 서비스키)
+            if isinstance(err, dict):
+                code = err.get("code") or err.get("resultCode") or ""
+                msg = err.get("message") or err.get("resultMsg") or err
+                raise RuntimeError(f"{code}: {_mask(msg)}" if code else _mask(err))
+            raise RuntimeError(_mask(err))
         header = data.get("header") or {}
         code = str(header.get("resultCode", ""))
         if code.startswith("ERROR"):

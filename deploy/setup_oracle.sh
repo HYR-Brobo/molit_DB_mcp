@@ -13,9 +13,9 @@ ENV_FILE=/etc/molit-mcp.env
 
 # 0) 이 VM에서 국토부 서버에 닿는지 먼저 확인 (안 되면 이후 작업이 무의미)
 echo "== 국토부 서버 연결 확인"
-if curl -s -o /dev/null -m 10 "https://openapi.molit.go.kr/"; then
+if curl -s -o /dev/null -m 10 "https://data.molit.go.kr/"; then
   echo "   https 연결 OK"
-elif curl -s -o /dev/null -m 10 "http://openapi.molit.go.kr/"; then
+elif curl -s -o /dev/null -m 10 "http://data.molit.go.kr/"; then
   echo "   http 연결 OK"
 else
   echo "   연결 실패: 이 VM에서도 국토부 서버가 막혀 있습니다. 여기서 중단합니다."; exit 1
