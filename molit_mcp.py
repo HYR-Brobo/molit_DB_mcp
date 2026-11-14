@@ -76,7 +76,9 @@ def _safe(fn):
         try:
             return fn(*args, **kwargs)
         except Exception as e:  # noqa: BLE001
-            return {"error": f"{type(e).__name__}: {_mask(e)}"}
+            msg = f"{type(e).__name__}: {_mask(e)}"
+            # 반환 타입이 str인 도구는 문자열로 돌려줘야 출력 스키마와 맞음
+            return msg if fn.__annotations__.get("return") in (str, "str") else {"error": msg}
     return wrapper
 
 
@@ -182,7 +184,7 @@ def get_dataset(title: str = "", creator: str = "", page: int = 1) -> dict:
 
 @mcp.tool()
 @_safe
-def raw_response(api: str, query: str):
+def raw_response(api: str, query: str) -> str:
     """[점검용] API 원본 응답을 그대로 본다. api는 'search' 또는 'dataset'.
     다른 도구 결과가 계속 비어 있을 때만 사용해서 응답 구조를 확인할 것."""
     import json
