@@ -6,6 +6,7 @@ AI(Claude)가 국토부 데이터를 스스로 검색·조회하며 공모전 �
 인증키:     환경변수 MOLIT_KEY (MCP 등록할 때 같이 넣어줌)
 """
 
+import functools
 import os
 
 import requests
@@ -15,9 +16,12 @@ try:                                            # mcp 2.x
 except ImportError:                             # mcp 1.x
     from mcp.server.fastmcp import FastMCP as Server
 
-BASE = "http://openapi.molit.go.kr/api/openapi"
-SEARCH_URL = f"{BASE}/search/getOpenApiSearchList"
-DATASET_URL = f"{BASE}/dataset/getOpenApiDatasetList"
+HOST = "openapi.molit.go.kr"
+PATH = "/api/openapi"
+SEARCH_URL = "/search/getOpenApiSearchList"
+DATASET_URL = "/dataset/getOpenApiDatasetList"
+# https 먼저, 안 되면 http. 둘 다 실패하면 각각의 실패 이유를 함께 돌려줌.
+SCHEMES = ("https", "http")
 KEY = os.environ.get("MOLIT_KEY", "")
 
 CATEGORIES = ["국토도시", "주택토지", "교통물류", "항공", "도로철도", "일반", "융합(기타)"]
@@ -30,17 +34,50 @@ mcp = Server(
 
 
 # ───────────── 내부 함수 ─────────────
-def _call(url: str, params: dict) -> dict:
+def _mask(text) -> str:
+    """에러 메시지·로그에 서비스키가 평문으로 남지 않게 가림."""
+    text = str(text)
+    if KEY:
+        text = text.replace(KEY, "***")
+        text = text.replace(requests.utils.quote(KEY, safe=""), "***")
+    return text
+
+
+def _call(path: str, params: dict) -> dict:
     if not KEY:
         raise RuntimeError("MOLIT_KEY 환경변수에 인증키가 없습니다.")
-    r = requests.get(url, params={"serviceKey": KEY, "returnType": "JSON", **params}, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    header = data.get("header") or {}
-    code = str(header.get("resultCode", ""))
-    if code.startswith("ERROR"):
-        raise RuntimeError(f"{code}: {header.get('resultMsg')}")
-    return data
+    failures = []
+    for scheme in SCHEMES:
+        url = f"{scheme}://{HOST}{PATH}{path}"
+        try:
+            r = requests.get(url, params={"serviceKey": KEY, "returnType": "JSON", **params}, timeout=20)
+        except requests.RequestException as e:
+            # 연결 단계 실패(거부·타임아웃·DNS 등) → 다음 scheme 시도
+            failures.append(f"{scheme}: {type(e).__name__}: {_mask(e)}")
+            continue
+        if r.status_code >= 400:
+            raise RuntimeError(f"{scheme} HTTP {r.status_code}: {_mask(r.text[:300])}")
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(f"{scheme} 응답이 JSON이 아님: {_mask(r.text[:300])}")
+        header = data.get("header") or {}
+        code = str(header.get("resultCode", ""))
+        if code.startswith("ERROR"):
+            raise RuntimeError(f"{code}: {header.get('resultMsg')}")
+        return data
+    raise RuntimeError("국토부 서버에 연결하지 못함 → " + " | ".join(failures))
+
+
+def _safe(fn):
+    """도구 안에서 난 예외를 일반 문구로 삼키지 않고, 원인을 문자열로 돌려줌."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"{type(e).__name__}: {_mask(e)}"}
+    return wrapper
 
 
 def _items(data: dict) -> list:
@@ -70,6 +107,7 @@ def _short(text, n=300):
 
 # ───────────── AI가 쓰는 도구 ─────────────
 @mcp.tool()
+@_safe
 def search_data(query: str, categories: list[str] | None = None, page: int = 1) -> dict:
     """국토교통 데이터를 키워드로 검색한다. 데이터 '값'이 아니라 '설명'(제목·설명·기관·키워드)을 돌려준다.
 
@@ -102,6 +140,7 @@ def search_data(query: str, categories: list[str] | None = None, page: int = 1) 
 
 
 @mcp.tool()
+@_safe
 def get_dataset(title: str = "", creator: str = "", page: int = 1) -> dict:
     """제목 또는 제공기관으로 데이터셋을 조회한다. 데이터 기간·라이선스·포함된 파일 목록(다운로드 주소)까지 나온다.
 
@@ -142,7 +181,8 @@ def get_dataset(title: str = "", creator: str = "", page: int = 1) -> dict:
 
 
 @mcp.tool()
-def raw_response(api: str, query: str) -> str:
+@_safe
+def raw_response(api: str, query: str):
     """[점검용] API 원본 응답을 그대로 본다. api는 'search' 또는 'dataset'.
     다른 도구 결과가 계속 비어 있을 때만 사용해서 응답 구조를 확인할 것."""
     import json
