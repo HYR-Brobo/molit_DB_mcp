@@ -185,15 +185,41 @@ def run_web():
         # 외부 주소(터널 도메인)로 들어오는 요청을 막지 않도록. 대신 아래 토큰 검사로 보호.
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
-    expected = f"Bearer {token}".encode()
+    import logging
+    log = logging.getLogger("uvicorn.error")
+    token = token.strip().strip('"').strip("'")
+
+    def _clean(raw: str) -> str:
+        """'Bearer xxx', 'xxx', 따옴표·공백 섞인 값까지 토큰만 뽑아냄."""
+        v = raw.strip().strip('"').strip("'")
+        if v.lower().startswith("bearer"):
+            v = v[6:].strip()
+        return v.strip('"').strip("'")
+
+    async def _deny(send, status, msg):
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"text/plain"),
+                                (b"www-authenticate", b"Bearer")]})
+        await send({"type": "http.response.body", "body": msg.encode()})
 
     async def guarded(scope, receive, send):
         if scope["type"] == "http":
-            auth = dict(scope.get("headers") or []).get(b"authorization", b"")
-            if not hmac.compare_digest(auth, expected):
-                await send({"type": "http.response.start", "status": 401,
-                            "headers": [(b"content-type", b"text/plain")]})
-                await send({"type": "http.response.body", "body": b"unauthorized"})
+            path = scope.get("path", "")
+            # 로그인 방식 탐색 요청엔 "OAuth 없음"(404)으로 답해서 헤더 인증으로 넘어가게 함
+            if path.startswith("/.well-known/"):
+                await _deny(send, 404, "no oauth")
+                return
+            headers = dict(scope.get("headers") or [])
+            raw = headers.get(b"authorization", b"").decode("utf-8", "ignore")
+            if not raw:
+                log.warning("[auth] Authorization 헤더 없음 → 401 (%s %s)", scope.get("method"), path)
+                await _deny(send, 401, "missing token")
+                return
+            got = _clean(raw)
+            if not hmac.compare_digest(got.encode(), token.encode()):
+                log.warning("[auth] 토큰 불일치 → 401 (받은 값 길이 %d / 서버 값 길이 %d, 앞 4자 %r)",
+                            len(got), len(token), got[:4])
+                await _deny(send, 401, "wrong token")
                 return
         await app(scope, receive, send)
 
