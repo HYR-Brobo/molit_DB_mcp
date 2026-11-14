@@ -25,6 +25,7 @@ DATASET_URL = "/dataset/getOpenApiDatasetList"
 SCHEMES = ("https", "http")
 KEY = os.environ.get("MOLIT_KEY", "")
 
+DATA_TYPES = ["dataset", "dataservice"]
 CATEGORIES = ["국토도시", "주택토지", "교통물류", "항공", "도로철도", "일반", "융합(기타)"]
 
 mcp = Server(
@@ -125,17 +126,23 @@ def _short(text, n=300):
 # ───────────── AI가 쓰는 도구 ─────────────
 @mcp.tool()
 @_safe
-def search_data(query: str, categories: list[str] | None = None, page: int = 1) -> dict:
+def search_data(query: str, categories: list[str] | None = None,
+                data_types: list[str] | None = None, page: int = 1) -> dict:
     """국토교통 데이터를 키워드로 검색한다. 데이터 '값'이 아니라 '설명'(제목·설명·기관·키워드)을 돌려준다.
 
     탐색 요령:
     - 한 단어로 시작해서 결과에 나온 키워드로 넓혀갈 것 (예: 통학 → 셔틀 → 환승 → 정류장).
     - 결과가 많으면 categories로 좁히기. 가능한 값: 국토도시, 주택토지, 교통물류, 항공, 도로철도, 일반, 융합(기타)
+    - data_types로 종류를 고를 수 있음: dataset(데이터셋), dataservice(데이터서비스). 비우면 전부.
     - total이 perPage보다 크면 page를 올려 더 볼 수 있음.
     """
     params = {"page": page, "perPage": 20, "searchQuery": query}
-    if categories:
-        params["categoryNames"] = ",".join(c for c in categories if c in CATEGORIES)
+    cats = [c for c in (categories or []) if c in CATEGORIES]
+    if cats:
+        params["categoryNames"] = ",".join(cats)
+    types = [t for t in (data_types or []) if t in DATA_TYPES]
+    if types:
+        params["dataTypes"] = ",".join(types)
     data = _call(SEARCH_URL, params)
     return {
         "query": query,
@@ -166,6 +173,7 @@ def get_dataset(title: str = "", creator: str = "", page: int = 1) -> dict:
     - 두 데이터를 엮을 수 있는지 볼 때, 기간(period)이 겹치는지 확인.
     - 공모전 제출용이면 license(이용허락범위)도 확인.
     title·creator 중 하나 이상 넣을 것. 부분 일치로 찾힘.
+    국토부 서버가 creator 조건을 제대로 거르지 않아서, 제공·관리기관에 creator가 없는 결과는 여기서 뺀다.
     """
     params = {"page": page, "perPage": 20}
     if title:
@@ -173,7 +181,15 @@ def get_dataset(title: str = "", creator: str = "", page: int = 1) -> dict:
     if creator:
         params["creator"] = creator
     data = _call(DATASET_URL, params)
-    return {
+    items = _items(data)
+    excluded = 0
+    if creator:
+        want = creator.replace(" ", "")
+        kept = [ds for ds in items
+                if want in (ds.get("creatorNm") or "").replace(" ", "")
+                or want in (ds.get("publisherNm") or "").replace(" ", "")]
+        excluded, items = len(items) - len(kept), kept
+    result = {
         "total": _total(data),
         "datasets": [
             {
@@ -192,9 +208,12 @@ def get_dataset(title: str = "", creator: str = "", page: int = 1) -> dict:
                     for f in (ds.get("datasetDataList") or [])
                 ],
             }
-            for ds in _items(data)
+            for ds in items
         ],
     }
+    if excluded:
+        result["note"] = f"서버가 돌려준 결과 중 제공·관리기관이 '{creator}'가 아닌 {excluded}건을 뺐음 (total은 서버 기준)"
+    return result
 
 
 @mcp.tool()
