@@ -132,6 +132,8 @@ def search_data(query: str, categories: list[str] | None = None,
 
     탐색 요령:
     - 한 단어로 시작해서 결과에 나온 키워드로 넓혀갈 것 (예: 통학 → 셔틀 → 환승 → 정류장).
+      여러 단어를 넣으면 단어 중 하나만 맞아도 걸려서 결과가 폭증함 (예: '버스 정류장 정보' → 1만 건 이상).
+    - 각 결과의 상세(기간·라이선스·파일)는 API로 조회되지 않음. url의 상세 페이지를 볼 것.
     - 결과가 많으면 categories로 좁히기. 가능한 값: 국토도시, 주택토지, 교통물류, 항공, 도로철도, 일반, 융합(기타)
     - data_types: dataset(데이터셋), dataservice(데이터서비스). 비우면 이 둘만 검색.
       지난 공모전·분석과제 출품작까지 보려면 ["all"] (어떤 데이터가 어떤 아이디어에 쓰였는지 참고용).
@@ -167,15 +169,12 @@ def search_data(query: str, categories: list[str] | None = None,
 @mcp.tool()
 @_safe
 def get_dataset(title: str = "", creator: str = "", page: int = 1) -> dict:
-    """제목 또는 제공기관으로 데이터셋을 조회한다. 데이터 기간·라이선스·포함된 파일 목록(다운로드 주소)까지 나온다.
+    """분석센터에 직접 등록된 '분석 데이터셋'(현재 5건뿐)을 조회한다. 기간·라이선스·파일 다운로드 주소가 나온다.
 
-    쓰는 때:
-    - search_data로 찾은 데이터가 쓸 만해 보일 때, 그 제목으로 상세 확인.
-    - 두 데이터를 엮을 수 있는지 볼 때, 기간(period)이 겹치는지 확인.
-    - 공모전 제출용이면 license(이용허락범위)도 확인.
-    title로 찾을 것. 부분 일치로 찾힘.
-    creator(제공기관)는 국토부 서버가 제대로 거르지 않아 대부분 0건이 됨(맞지 않는 결과는 여기서 뺌).
-    특정 기관 데이터를 찾으려면: search_data로 검색 → 결과의 agency로 기관 확인 → 그 title로 이 도구 호출.
+    주의: search_data 결과(1만 건 이상)는 이 도구로 상세 조회되지 않는다(제목으로 넣어도 0건).
+    search_data 결과의 상세는 그 결과의 url(상세 페이지)을 볼 것.
+    title은 부분 일치. creator를 넣으면 제공·관리기관이 맞지 않는 결과를 뺀다
+    (서버는 creator를 무시하고 같은 결과를 돌려줌).
     """
     params = {"page": page, "perPage": 20}
     if title:
@@ -206,7 +205,8 @@ def get_dataset(title: str = "", creator: str = "", page: int = 1) -> dict:
                 "access": ds.get("accessRights"),
                 "page_url": ds.get("landingPage"),
                 "files": [
-                    {"name": f.get("dataNm"), "url": f.get("urlOutr")}
+                    {"name": f.get("dataNm"),
+                     "url": f.get("dataDownloadUrl") or f.get("urlOutr")}
                     for f in (ds.get("datasetDataList") or [])
                 ],
             }
@@ -239,7 +239,8 @@ def contest_ideas(theme: str) -> str:
 
 1. search_data로 '{theme}'와 관련 단어들을 검색해 후보 데이터를 넓게 모아.
    결과에 나온 키워드를 다음 검색어로 써서 최소 5번 이상 넓혀가.
-2. 서로 엮을 수 있어 보이는 데이터는 get_dataset으로 기간·지역 단위·라이선스를 확인해.
+2. 서로 엮을 수 있어 보이는 데이터는 검색 결과의 url(상세 페이지)에서 기간·지역 단위·라이선스를 확인해.
+   (get_dataset은 분석센터 등록 데이터셋 5건만 조회되므로 검색 결과 확인에는 쓰지 말 것)
 3. 데이터 2~3개를 조합한 아이디어 3개를 제안해. 각 아이디어마다:
    - 어떤 데이터를 무엇을 기준으로(시간·위치·지역코드 등) 합치는지
    - 그걸로 풀 수 있는 문제와 결과물(분석/서비스)
