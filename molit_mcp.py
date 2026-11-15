@@ -64,6 +64,7 @@ class Server(_BaseServer):
 mcp = Server(
     "molit-data",
     instructions="""국토교통 협력형 분석센터(data.molit.go.kr)의 데이터 '목록'을 찾는 도구. 데이터 값은 주지 않고 설명(메타데이터)만 준다.
+도구는 search_data·get_detail·list_analysis_datasets 세 개다. 도구 목록에 이름만 있으면(지연 로딩) 셋을 한꺼번에 불러와 쓴다.
 
 목록이 두 개이고 서로 크기가 전혀 다르다:
 1. 통합 목록 (1만 건 이상) → search_data
@@ -225,13 +226,34 @@ def _analysis_datasets(max_age: float = 600) -> list:
 
 
 def _kind(url) -> str:
-    """상세 페이지 주소로 항목 종류를 구분."""
+    """상세 페이지 주소로 항목 종류를 구분. 파일형/Open API형은 주소로 안 갈려서 search_data에서 다시 나눈다."""
     url = url or ""
     if "/data-search/" in url:
         return "데이터"
     if "/asmt/" in url:
         return "분석과제"
     return "기타"
+
+
+TYPE_NAMES = {"dataset": "파일형", "dataservice": "Open API형"}
+
+
+def _dataservice_urls(query: str, categories) -> set | None:
+    """같은 검색 조건의 Open API형 결과 주소 전부. 검색 응답엔 파일형/API형 표시가 없어서 한 번 더 물어 구분한다.
+    Open API형은 파일형보다 훨씬 적어(예: '환승' 323건 중 24건) 한 쪽에 다 들어온다. 다 안 들어오면 None(구분 포기)."""
+    params = {"page": 1, "perPage": 100, "searchQuery": query, "dataTypes": "dataservice"}
+    if categories:
+        params["categoryNames"] = ",".join(categories)
+    data = _call(SEARCH_URL, params)
+    items = _items(data)
+    if (_total(data) or 0) > len(items):
+        return None
+    return {it.get("detailPage") for it in items}
+
+
+NEXT_STEP = ("쓸 만한 후보만 url을 get_detail에 넣으면 원본 포털·파일 목록·저작권·받는 방법(how_to_get)이 나온다. "
+             "get_detail이 도구 목록에 이름만 있으면 먼저 불러와서 쓴다. "
+             "도구 목록에 아예 없으면 없다고 결론 내지 말고, 사용자에게 커넥터를 껐다 켜거나 다시 연결해 도구 목록을 새로 받으라고 알린다.")
 
 
 def _search_hint(query: str, total, page: int, narrowed: bool) -> str:
@@ -267,8 +289,8 @@ def search_data(
 ) -> dict:
     """통합 목록(1만 건 이상)에서 국토교통 데이터를 키워드로 찾는다. 데이터를 찾을 때 항상 이 도구부터 쓴다.
 
-    돌려주는 것: 제목·분야·기관·키워드·설명·상세페이지 주소(url). 데이터 '값'은 주지 않는다.
-    돌려주지 않는 것: 파일 목록·원본 포털·저작권. 필요한 후보만 결과의 url을 get_detail에 넣어 확인한다.
+    돌려주는 것: 제목·종류(kind: 파일형/Open API형/분석과제)·분야·기관·키워드·설명·상세페이지 주소(url). 데이터 '값'은 주지 않는다.
+    돌려주지 않는 것: 파일 목록·원본 포털·저작권. 필요한 후보만 결과의 url을 get_detail에 넣어 확인한다 (응답의 next_step 참고).
       예외로, 결과에 analysis_dataset이 붙어 있으면 그 항목은 파일 주소·라이선스가 그 안에 이미 들어 있다.
 
     검색 요령: 한 단어로 시작해 결과의 keywords에서 다음 검색어를 골라 넓혀간다 (통학 → 셔틀 → 환승 → 정류장).
@@ -306,11 +328,28 @@ def search_data(
             row["analysis_dataset"] = {k: view[k] for k in ("files", "license", "period", "original_page", "how_to_get")}
         results.append(row)
 
+    # 파일형/Open API형 나누기. 한 종류만 골랐으면 그대로, 섞여 있으면 Open API형 주소를 따로 받아 맞춰 본다.
+    data_rows = [r for r in results if r["kind"] == "데이터"]
+    picked = [t for t in types if t in TYPE_NAMES]
+    if data_rows and "all" not in types and len(picked) == 1:
+        for r in data_rows:
+            r["kind"] = TYPE_NAMES[picked[0]]
+    elif data_rows:
+        try:
+            api_urls = _dataservice_urls(query, categories)
+        except Exception:  # noqa: BLE001  구분 못 해도 검색 결과는 그대로 돌려줌
+            api_urls = None
+        if api_urls is not None:
+            for r in data_rows:
+                r["kind"] = "Open API형" if r["url"] in api_urls else "파일형"
+
     total = _total(data)
     out = {"query": query, "page": page, "total": total, "results": results}
     hint = _search_hint(query, total, page, bool(categories or data_types))
     if hint:
         out["hint"] = hint
+    if data_rows:
+        out["next_step"] = NEXT_STEP
     return out
 
 
