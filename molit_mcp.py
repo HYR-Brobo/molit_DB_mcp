@@ -336,6 +336,13 @@ def _group_variants(results: list) -> tuple[list, int]:
     return out, merged
 
 
+# data_types=['all']은 정렬이 달라져 보도자료·시나리오 파일이 앞을 채운다. 2026-11 '자율주행' all 검색은 1·2쪽에
+# 부산 자율주행버스 Open API 8종이 하나도 없어서, AI가 '자율주행 운행 데이터는 없다'고 잘못 결론 냈다.
+# 인자 설명은 재연결 전까지 옛 것이 보이므로 응답 hint에도 넣는다.
+ALL_TYPES_HINT = ("data_types=all은 보도자료·과제가 섞여 데이터가 뒤로 밀린다. "
+                  "데이터가 없다고 결론 내기 전에 data_types 없이 같은 검색어로 다시 검색한다.")
+
+
 def _search_hint(query: str, total, page: int, narrowed: bool) -> str:
     words = query.split()
     total = total or 0
@@ -365,7 +372,8 @@ def search_data(
     categories: Annotated[list[Category] | None, Field(description="분야로 좁히기. 비우면 전체.")] = None,
     data_types: Annotated[list[DataType] | None, Field(
         description="비우면 데이터(dataset=파일형, dataservice=Open API형)만 검색. "
-                    "['all']이면 지난 분석과제·공모전 출품작도 포함(어떤 데이터가 어떤 아이디어에 쓰였는지 참고용).")] = None,
+                    "['all']이면 지난 분석과제·공모전 출품작·보도자료도 섞이고 정렬이 달라져 데이터가 뒤로 밀린다. "
+                    "어떤 데이터가 어떤 아이디어에 쓰였는지 참고할 때만 쓰고, 데이터가 있는지는 비운 채로 검색해 판단한다.")] = None,
     page: Annotated[int, Field(description="결과는 한 번에 20건. total이 더 크면 2, 3…으로 다음 쪽.", ge=1)] = 1,
 ) -> dict:
     """통합 목록(1만 건 이상)에서 국토교통 데이터를 키워드로 찾는다. 데이터를 찾을 때 항상 이 도구부터 쓴다.
@@ -432,6 +440,8 @@ def search_data(
     if merged:
         out["grouped"] = f"다른 등록본 {merged}건을 variants에 묶음. 과거 이력은 파일형, 실시간·최신값은 Open API형 등록본."
     hint = _search_hint(query, total, page, bool(categories or data_types))
+    if "all" in types and (total or 0) > PER_PAGE:
+        hint = f"{hint} {ALL_TYPES_HINT}".strip()
     if hint:
         out["hint"] = hint
     if data_rows:
