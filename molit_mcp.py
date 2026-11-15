@@ -336,23 +336,50 @@ def _size(n) -> str:
     return ""
 
 
+# 사이트 내부 API는 CSRF 이중 제출 방식을 씀: XSRF-TOKEN 쿠키 값을 X-XSRF-TOKEN 헤더로 같이 보내야 함.
+# 헤더가 없으면 HTTP 200에 본문만 {"status":403,"message":"해당 페이지에 접근할 권한이 없습니다."}로 거절한다.
+# 쿠키는 상세 페이지 HTML이 아니라 /api/ 아래 GET 응답에서 발급되므로, 가벼운 GET 하나로 받아 둔다.
+TOKEN_URL = f"https://{HOST}/api/common/getServerProperties"
+_site = requests.Session()
+
+
+def _xsrf_token(refresh: bool = False) -> str:
+    if refresh:
+        _site.cookies.clear()
+    token = _site.cookies.get("XSRF-TOKEN")
+    if not token:
+        _site.get(TOKEN_URL, timeout=20)
+        token = _site.cookies.get("XSRF-TOKEN")
+    if not token:
+        raise RuntimeError("분석센터가 XSRF-TOKEN 쿠키를 주지 않음 (사이트 방식이 바뀌었을 수 있음)")
+    return token
+
+
 def _detail_call(seq: str) -> dict:
     body = {"resourceSeq": seq, "siteCode": "molit_anals", "algrthId": "1", "simildegerPt": 50,
             "simildegerSort": None, "hitResourceSort": None, "startRow": 0, "rowsPerPage": 10}
-    try:
-        r = requests.post(DETAIL_URL, json=body, timeout=20,
-                          headers={"Accept": "application/json", "Referer": f"https://{HOST}/anals/data-search/detail/{seq}"})
-    except requests.RequestException as e:
-        raise RuntimeError(f"상세 정보 서버에 연결하지 못함: {type(e).__name__}: {e}")
-    if r.status_code >= 400:
-        raise RuntimeError(f"상세 정보 HTTP {r.status_code}: {r.text[:300]}")
-    try:
-        data = r.json()
-    except ValueError:
-        raise RuntimeError(f"상세 정보 응답이 JSON이 아님: {r.text[:300]}")
-    if not data.get("success") or not isinstance(data.get("result"), dict):
-        raise RuntimeError(f"상세 정보 조회 실패: {data.get('message') or str(data)[:300]}")
-    return data["result"]
+    for attempt in range(2):        # 토큰이 만료됐을 수 있으니 403이면 새로 받아 한 번 더
+        try:
+            r = _site.post(DETAIL_URL, json=body, timeout=20, headers={
+                "Accept": "application/json",
+                "Referer": f"https://{HOST}/anals/data-search/detail/{seq}",
+                "X-XSRF-TOKEN": _xsrf_token(refresh=attempt > 0),
+            })
+        except requests.RequestException as e:
+            raise RuntimeError(f"상세 정보 서버에 연결하지 못함: {type(e).__name__}: {e}")
+        if r.status_code >= 400 and r.status_code != 403:
+            raise RuntimeError(f"상세 정보 HTTP {r.status_code}: {r.text[:300]}")
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(f"상세 정보 응답이 JSON이 아님: {r.text[:300]}")
+        denied = r.status_code == 403 or str(data.get("status")) == "403"
+        if denied and attempt == 0:
+            continue
+        if not data.get("success") or not isinstance(data.get("result"), dict):
+            raise RuntimeError(f"상세 정보 조회 실패: {data.get('message') or str(data)[:300]}")
+        return data["result"]
+    raise RuntimeError("상세 정보 조회 실패: 토큰을 새로 받아도 접근이 거부됨")
 
 
 @mcp.tool()
