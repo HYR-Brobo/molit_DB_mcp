@@ -255,7 +255,8 @@ def _dataservice_urls(query: str, categories) -> set | None:
 
 NEXT_STEP = ("쓸 만한 후보의 url을 get_detail에 넣으면 원본 포털·파일 목록·저작권·받는 방법(how_to_get)과 "
              "유사 데이터(related: 다른 집계 단위·다른 등록본·함께 쓸 데이터)가 나온다. "
-             f"답변에서 받는 방법을 말할 데이터는 전부 확인하되, 여러 개면 url 리스트로 한 번에 넣는다(최대 {DETAIL_MAX}개). "
+             f"답변에서 받는 방법을 말할 데이터는 전부 확인하되, 여러 개면 urls 인자에 리스트로 한 번에 넣는다(최대 {DETAIL_MAX}개). "
+             "related·variants의 다른 등록본이나 집계 단위도 각각 상세를 확인해야 하며, 받는 방법·저작권·기간이 같다고 추정하지 않는다. "
              "get_detail이 도구 목록에 이름만 있으면 먼저 불러와서 쓴다. "
              "도구 목록에 아예 없으면 없다고 결론 내지 말고, 사용자에게 커넥터를 껐다 켜거나 다시 연결해 도구 목록을 새로 받으라고 알린다.")
 
@@ -492,7 +493,21 @@ def _related(res: dict, seq: str) -> list:
         other = s.get("similrResourceSeq")
         if not other or str(other) == seq:
             continue
+        # 유사도는 동일성의 증명이 아니다. 100점이어도 다른 등록본 '후보'로 안내한다.
+        try:
+            same = float(s.get("simildegerPt")) == 100
+        except (TypeError, ValueError):
+            same = False
+        kind = TYPE_NAMES.get(s.get("type"), "미확인")
+        kind_source = "원본 type" if kind != "미확인" else "상세 확인 필요"
+        # 현재 유사 목록은 resourceType='개방 데이터'만 주어 종류가 구분되지 않는다.
+        # 명시적인 제목 표기만 보조 단서로 쓰고, 상세 확인된 종류와 구별한다.
+        title = s.get("title") or ""
+        if kind == "미확인" and re.search(r"\(FILE\)", title, re.IGNORECASE):
+            kind, kind_source = "파일형", "제목 (FILE) 표기 기반 추정; 상세 확인 필요"
         out.append({"title": s.get("title"), "agency": s.get("agentName"),
+                    "kind": kind, "kind_source": kind_source,
+                    "relationship": "같은 데이터의 다른 등록본 후보" if same else "유사 데이터",
                     "similarity": s.get("simildegerPt"), "url": _detail_url(other)})
     return out
 
@@ -500,9 +515,11 @@ def _related(res: dict, seq: str) -> list:
 @mcp.tool()
 @_safe
 def get_detail(
-    url: Annotated[str | list[str], Field(
-        description="search_data 결과의 url(…/data-search/detail/숫자) 또는 그 끝의 숫자 id. "
-                    f"여러 개를 확인할 때는 리스트로 한 번에 넣는다(최대 {DETAIL_MAX}개).")],
+    url: Annotated[str | list[str] | None, Field(
+        description="기존 호출 호환용: 상세 url 또는 숫자 id 하나(기존 리스트도 지원). 여러 후보는 urls를 사용. urls와 동시에 지정하지 않는다.")] = None,
+    urls: Annotated[list[str] | None, Field(
+        description="권장: search_data·related·variants에서 고른 상세 url(…/data-search/detail/숫자) 또는 숫자 id 목록. "
+                    f"여러 후보를 한 번에 확인(최대 {DETAIL_MAX}개). url과 동시에 지정하지 않는다.")] = None,
 ) -> dict:
     """search_data에서 고른 항목의 상세 페이지 내용을 본다. 상세 페이지를 브라우저·curl로 직접 여는 대신 이걸 쓴다.
 
@@ -510,23 +527,28 @@ def get_detail(
     related(사이트가 꼽은 유사 데이터: 같은 데이터의 다른 집계 단위·다른 등록본·함께 쓸 만한 데이터).
     파일 '내용'은 주지 않는다. 대부분 파일은 제공기관 포털에 있고, 그 포털이 로그인·설문을 요구하면 사용자에게 안내한다.
 
-    url을 하나 넣으면 그 항목 하나를, 리스트로 넣으면 {count, items:[...]}로 돌려준다.
-    답변에서 받는 방법을 말할 데이터는 검색 결과 설명만 믿지 말고 전부 여기서 확인한다 (리스트로 한 번에).
+    urls=[...]를 쓰면 한 항목이어도 {count, items:[...]}로 돌려준다. 기존 url은 한 항목이면 단일 상세 응답을 유지한다.
+    답변에서 받는 방법을 말할 데이터는 검색 결과 설명만 믿지 말고 전부 여기서 확인한다 (urls로 한 번에).
+    related·variants도 각각 상세를 확인한다. 다른 등록본·집계 단위의 받는 방법·저작권·기간을 그대로 적용하지 않는다.
     """
-    urls = _as_urls(url)
-    if not urls:
-        return {"error": "url이 비어 있음. search_data 결과의 url을 넣어 주세요."}
-    if len(urls) == 1:
-        return _detail_one(urls[0])
+    if url is not None and urls is not None:
+        return {"error": "url과 urls는 동시에 지정할 수 없음. 여러 후보는 urls에 모아 주세요."}
+    inputs = _as_urls(urls if urls is not None else url) if (urls is not None or url is not None) else []
+    if not inputs:
+        return {"error": "url 또는 urls가 비어 있음. search_data 결과의 url을 넣어 주세요."}
+    if urls is None and len(inputs) == 1:
+        out = _detail_one(inputs[0])
+        out["batch_hint"] = f"추가 후보가 있으면 get_detail의 urls 인자에 리스트로 모아 한 번에 조회(최대 {DETAIL_MAX}개)."
+        return out
     items = []
-    for u in urls[:DETAIL_MAX]:
+    for u in inputs[:DETAIL_MAX]:
         try:
             items.append(_detail_one(u))
         except Exception as e:  # noqa: BLE001  하나가 실패해도 나머지는 돌려줌
-            items.append({"input": u, "error": f"{type(e).__name__}: {e}"})
+            items.append({"input": u, "error": f"{type(e).__name__}: {_mask(e)}"})
     out = {"count": len(items), "items": items}
-    if len(urls) > DETAIL_MAX:
-        out["notice"] = f"한 번에 {DETAIL_MAX}개까지만 봄. 나머지 {len(urls) - DETAIL_MAX}개는 다시 호출."
+    if len(inputs) > DETAIL_MAX:
+        out["notice"] = f"한 번에 {DETAIL_MAX}개까지만 봄. 나머지 {len(inputs) - DETAIL_MAX}개는 다시 호출."
     return out
 
 
@@ -588,6 +610,9 @@ def _detail_one(url: str) -> dict:
     related = _related(res, seq)
     if related:
         out["related"] = related
+        out["related_hint"] = ("related는 미검증 후보 목록이다. kind가 미확인이면 상세의 type으로 확인한다. "
+                               "유사도 100도 동일성을 보장하지 않으며 다른 등록본은 받는 방법·라이선스·기간이 다를 수 있다. "
+                               "추천에 사용할 후보는 urls로 묶어 상세 조회하고, 결합할 데이터는 기간·집계 단위가 맞는지 확인한다.")
     return out
 
 
@@ -634,8 +659,9 @@ def contest_ideas(theme: str) -> str:
 
 1. search_data로 '{theme}'와 관련 단어들을 한 단어씩 검색해 후보 데이터를 넓게 모아.
    결과에 나온 키워드를 다음 검색어로 써서 최소 5번 이상 넓혀가.
-2. 서로 엮을 수 있어 보이는 데이터는 get_detail에 url 리스트를 한 번에 넣어 파일 목록·받는 곳·저작권을 확인해.
-   응답의 related(유사 데이터)에 다른 집계 단위나 짝이 되는 데이터가 있으면 후보에 넣어.
+2. 서로 엮을 수 있어 보이는 데이터는 get_detail의 urls 인자에 리스트를 한 번에 넣어 파일 목록·받는 곳·저작권을 확인해.
+   응답의 related·variants에 다른 집계 단위나 등록본이 있으면 후보에 넣고, 사용할 후보는 각각 상세를 확인해.
+   다른 항목의 다운로드 방법·라이선스·기간을 그대로 적용하지 마. 자동승인이어도 활용신청 등 how_to_get의 절차를 안내해.
    (list_analysis_datasets는 별개의 작은 목록이라 검색 결과의 상세 확인에는 쓸 수 없음)
 3. 데이터 2~3개를 조합한 아이디어 3개를 제안해. 각 아이디어마다:
    - 어떤 데이터를 무엇을 기준으로(시간·위치·지역코드 등) 합치는지
