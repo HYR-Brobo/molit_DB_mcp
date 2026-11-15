@@ -8,8 +8,11 @@ AI(Claude)가 국토부 데이터를 스스로 검색·조회하며 공모전 �
 
 import functools
 import os
+import time
+from typing import Annotated, Literal
 
 import requests
+from pydantic import Field
 
 try:                                            # mcp 2.x
     from mcp.server.mcpserver import MCPServer as Server
@@ -25,13 +28,24 @@ DATASET_URL = "/dataset/getOpenApiDatasetList"
 SCHEMES = ("https", "http")
 KEY = os.environ.get("MOLIT_KEY", "")
 
-DATA_TYPES = ["dataset", "dataservice"]
-CATEGORIES = ["국토도시", "주택토지", "교통물류", "항공", "도로철도", "일반", "융합(기타)"]
+Category = Literal["국토도시", "주택토지", "교통물류", "항공", "도로철도", "일반", "융합(기타)"]
+DataType = Literal["dataset", "dataservice", "all"]
+PER_PAGE = 20
 
 mcp = Server(
     "molit-data",
-    instructions="국토교통 협력형 분석센터의 데이터 목록을 검색·조회한다. "
-                 "데이터 값이 아니라 데이터 설명(메타데이터)을 주므로, 아이디어 탐색·데이터 조합 구상에 쓴다.",
+    instructions="""국토교통 협력형 분석센터(data.molit.go.kr)의 데이터 '목록'을 찾는 도구. 데이터 값은 주지 않고 설명(메타데이터)만 준다.
+
+목록이 두 개이고 서로 크기가 전혀 다르다:
+1. 통합 목록 (1만 건 이상) → search_data
+   공공기관 데이터셋·Open API 전체. 제목·설명·기관·키워드·상세페이지 주소까지만 나온다.
+   기간·라이선스·파일은 API에 없으므로 결과의 url(상세 페이지)에서 확인해야 한다.
+2. 분석 데이터셋 목록 (몇 건뿐) → list_analysis_datasets
+   분석과제를 수행한 기관이 과제에 쓴 데이터를 직접 올려 둔 것. 파일 다운로드 주소·라이선스가 나온다.
+   통합 목록의 '상세 조회'가 아니다. 통합 목록에서 찾은 제목은 대부분 여기에 없다.
+
+쓰는 순서: search_data로 한 단어씩 검색하며 후보를 모은다 → 결과에 analysis_dataset이 붙은 항목만 파일까지 바로 받을 수 있고,
+나머지는 url을 사용자에게 안내한다. 결과가 0건이면 도구 고장이 아니라 그 목록에 없는 것이니, 응답의 hint를 따른다.""",
 )
 
 
@@ -123,112 +137,178 @@ def _short(text, n=300):
     return text if len(text) <= n else text[:n] + "…"
 
 
+def _norm(title) -> str:
+    return "".join((title or "").split())
+
+
+def _files(ds: dict) -> list:
+    """파일 정보가 통째로 빈 항목({name: null, url: null})은 뺌."""
+    out = []
+    for f in ds.get("datasetDataList") or []:
+        url = f.get("dataDownloadUrl") or f.get("dataUrl") or f.get("urlOutr")
+        if f.get("dataNm") or url:
+            out.append({"name": f.get("dataNm"), "url": url})
+    return out
+
+
+def _dataset_view(ds: dict) -> dict:
+    files, page_url = _files(ds), ds.get("landingPage")
+    return {
+        "title": ds.get("title"),
+        "category": ds.get("conceptName"),
+        "creator": ds.get("creatorNm"),
+        "publisher": ds.get("publisherNm"),
+        "keywords": ds.get("keyword"),
+        "description": _short(ds.get("description"), 500),
+        "period": _period(ds) or "미기재",
+        "license": ds.get("license") or "미기재",
+        "access": ds.get("accessRights"),
+        "registered": ds.get("issued"),
+        "files": files,
+        "original_page": page_url,
+        "how_to_get": ("files의 url로 바로 내려받음 (분석 기관이 올린 가공·샘플 데이터)" if files
+                       else "original_page(원본 포털)에서 받음" if page_url
+                       else "받을 수 있는 경로가 등록돼 있지 않음"),
+    }
+
+
+_ANALYSIS_CACHE = {"at": 0.0, "items": []}
+
+
+def _analysis_datasets(max_age: float = 600) -> list:
+    """분석 데이터셋 목록 전체. 몇 건뿐이라 통째로 받아 10분간 기억해 둠."""
+    if time.time() - _ANALYSIS_CACHE["at"] > max_age:
+        items, page = [], 1
+        while page <= 10:
+            data = _call(DATASET_URL, {"page": page, "perPage": 100})
+            got = _items(data)
+            items += got
+            if not got or len(items) >= (_total(data) or 0):
+                break
+            page += 1
+        _ANALYSIS_CACHE.update(at=time.time(), items=items)
+    return _ANALYSIS_CACHE["items"]
+
+
+def _kind(url) -> str:
+    """상세 페이지 주소로 항목 종류를 구분."""
+    url = url or ""
+    if "/data-search/" in url:
+        return "데이터"
+    if "/asmt/" in url:
+        return "분석과제"
+    return "기타"
+
+
+def _search_hint(query: str, total, page: int, narrowed: bool) -> str:
+    words = query.split()
+    total = total or 0
+    if total == 0:
+        tips = ["이 목록에 그 단어가 없음(도구 오류 아님)."]
+        if len(words) > 1:
+            tips.append(f"한 단어로 줄여 다시 검색: {' / '.join(words)}")
+        else:
+            tips.append("더 짧은 낱말이나 비슷한 말로 다시 검색 (예: 셔틀버스 → 셔틀, 통학 → 학교).")
+        if narrowed:
+            tips.append("categories·data_types 조건을 빼고 검색.")
+        return " ".join(tips)
+    if len(words) > 1 and total > PER_PAGE:
+        return (f"여러 단어는 '하나라도 맞으면 포함'으로 검색돼 {total}건이 됨. 관련 높은 것이 앞에 오긴 하지만, "
+                f"가장 구체적인 한 단어({max(words, key=len)})로 다시 검색하면 좁혀짐.")
+    if total > PER_PAGE * page:
+        return f"{total}건 중 {PER_PAGE * page}건까지 봄. 더 보려면 page={page + 1}, 좁히려면 categories 지정."
+    return ""
+
+
 # ───────────── AI가 쓰는 도구 ─────────────
 @mcp.tool()
 @_safe
-def search_data(query: str, categories: list[str] | None = None,
-                data_types: list[str] | None = None, page: int = 1) -> dict:
-    """국토교통 데이터를 키워드로 검색한다. 데이터 '값'이 아니라 '설명'(제목·설명·기관·키워드)을 돌려준다.
+def search_data(
+    query: Annotated[str, Field(description="검색어. 한 단어 권장(예: '환승'). 띄어 쓰면 단어 중 하나만 맞아도 걸려 결과가 폭증함.")],
+    categories: Annotated[list[Category] | None, Field(description="분야로 좁히기. 비우면 전체.")] = None,
+    data_types: Annotated[list[DataType] | None, Field(
+        description="비우면 데이터(dataset=파일형, dataservice=Open API형)만 검색. "
+                    "['all']이면 지난 분석과제·공모전 출품작도 포함(어떤 데이터가 어떤 아이디어에 쓰였는지 참고용).")] = None,
+    page: Annotated[int, Field(description="결과는 한 번에 20건. total이 더 크면 2, 3…으로 다음 쪽.", ge=1)] = 1,
+) -> dict:
+    """통합 목록(1만 건 이상)에서 국토교통 데이터를 키워드로 찾는다. 데이터를 찾을 때 항상 이 도구부터 쓴다.
 
-    탐색 요령:
-    - 한 단어로 시작해서 결과에 나온 키워드로 넓혀갈 것 (예: 통학 → 셔틀 → 환승 → 정류장).
-      여러 단어를 넣으면 단어 중 하나만 맞아도 걸려서 결과가 폭증함 (예: '버스 정류장 정보' → 1만 건 이상).
-    - 각 결과의 상세(기간·라이선스·파일)는 API로 조회되지 않음. url의 상세 페이지를 볼 것.
-    - 결과가 많으면 categories로 좁히기. 가능한 값: 국토도시, 주택토지, 교통물류, 항공, 도로철도, 일반, 융합(기타)
-    - data_types: dataset(데이터셋), dataservice(데이터서비스). 비우면 이 둘만 검색.
-      지난 공모전·분석과제 출품작까지 보려면 ["all"] (어떤 데이터가 어떤 아이디어에 쓰였는지 참고용).
-    - total이 perPage보다 크면 page를 올려 더 볼 수 있음.
+    돌려주는 것: 제목·분야·기관·키워드·설명·상세페이지 주소(url). 데이터 '값'은 주지 않는다.
+    돌려주지 않는 것: 기간·라이선스·파일. API에 없으므로 url의 상세 페이지에서 확인해야 한다.
+      예외로, 결과에 analysis_dataset이 붙어 있으면 그 항목은 파일 주소·라이선스가 그 안에 이미 들어 있다.
+
+    검색 요령: 한 단어로 시작해 결과의 keywords에서 다음 검색어를 골라 넓혀간다 (통학 → 셔틀 → 환승 → 정류장).
+    기관별로 찾고 싶으면 기관명을 검색어로 넣지 말고, 주제어로 검색한 뒤 결과의 agency를 본다.
+    결과가 0건이거나 너무 많으면 응답의 hint에 다음에 할 일이 적혀 있다.
     """
-    params = {"page": page, "perPage": 20, "searchQuery": query}
-    cats = [c for c in (categories or []) if c in CATEGORIES]
-    if cats:
-        params["categoryNames"] = ",".join(cats)
-    if "all" not in (data_types or []):
-        types = [t for t in (data_types or []) if t in DATA_TYPES] or DATA_TYPES
+    params = {"page": page, "perPage": PER_PAGE, "searchQuery": query}
+    if categories:
+        params["categoryNames"] = ",".join(categories)
+    types = data_types or ["dataset", "dataservice"]
+    if "all" not in types:
         params["dataTypes"] = ",".join(types)
     data = _call(SEARCH_URL, params)
-    return {
-        "query": query,
-        "page": page,
-        "total": _total(data),
-        "results": [
-            {
-                "title": it.get("title"),
-                "category": it.get("categoryName"),
-                "agency": it.get("agentName"),
-                "keywords": it.get("keyword"),
-                "description": _short(it.get("description")),
-                "url": it.get("detailPage"),
-                "modified": it.get("modified"),
-            }
-            for it in _items(data)
-        ],
-    }
+
+    try:        # 분석 데이터셋과 겹치는 항목엔 파일·라이선스를 바로 붙여 줌. 실패해도 검색 결과는 그대로.
+        analysis = {_norm(ds.get("title")): ds for ds in _analysis_datasets()}
+    except Exception:  # noqa: BLE001
+        analysis = {}
+
+    results = []
+    for it in _items(data):
+        row = {
+            "title": it.get("title"),
+            "kind": _kind(it.get("detailPage")),
+            "category": it.get("categoryName"),
+            "agency": it.get("agentName"),
+            "keywords": it.get("keyword"),
+            "description": _short(it.get("description")),
+            "url": it.get("detailPage"),
+            "modified": (it.get("modified") or "")[:10],
+        }
+        ds = analysis.get(_norm(it.get("title")))
+        if ds and row["kind"] == "데이터":
+            view = _dataset_view(ds)
+            row["analysis_dataset"] = {k: view[k] for k in ("files", "license", "period", "original_page", "how_to_get")}
+        results.append(row)
+
+    total = _total(data)
+    out = {"query": query, "page": page, "total": total, "results": results}
+    hint = _search_hint(query, total, page, bool(categories or data_types))
+    if hint:
+        out["hint"] = hint
+    return out
 
 
 @mcp.tool()
 @_safe
-def get_dataset(title: str = "", creator: str = "", page: int = 1) -> dict:
-    """분석센터에 직접 등록된 '분석 데이터셋'(현재 5건뿐)을 조회한다. 기간·라이선스·파일 다운로드 주소가 나온다.
+def list_analysis_datasets() -> dict:
+    """분석과제에 쓰인 뒤 분석센터에 따로 올라온 '분석 데이터셋'을 전부 보여준다(몇 건뿐이라 검색어 없이 통째로).
 
-    주의: search_data 결과(1만 건 이상)는 이 도구로 상세 조회되지 않는다(제목으로 넣어도 0건).
-    search_data 결과의 상세는 그 결과의 url(상세 페이지)을 볼 것.
-    title은 부분 일치. creator를 넣으면 제공·관리기관이 맞지 않는 결과를 뺀다
-    (서버는 creator를 무시하고 같은 결과를 돌려줌).
+    search_data 결과의 상세 조회가 아니다. search_data와는 별개의 작은 목록이라, 거기서 찾은 제목은 대부분 여기에 없다.
+    (겹치는 항목은 search_data 결과에 analysis_dataset으로 이미 붙어 나오므로, 그걸 확인하려고 이 도구를 부를 필요는 없다.)
+
+    쓰는 때: 다른 기관이 실제 분석에 쓴 가공·결합·샘플 데이터를 구경하거나, 바로 내려받을 파일이 필요할 때.
+    항목은 두 종류다. how_to_get에 어느 쪽인지 적혀 있다.
+    - 분석 기관이 직접 올린 파일: files에 다운로드 주소가 있음. 라이선스·기간은 대개 '미기재'.
+    - 원본 포털을 가리키는 항목: 파일은 없고 original_page(공공데이터포털 등)와 라이선스가 있음.
     """
-    params = {"page": page, "perPage": 20}
-    if title:
-        params["title"] = title
-    if creator:
-        params["creator"] = creator
-    data = _call(DATASET_URL, params)
-    items = _items(data)
-    excluded = 0
-    if creator:
-        want = creator.replace(" ", "")
-        kept = [ds for ds in items
-                if want in (ds.get("creatorNm") or "").replace(" ", "")
-                or want in (ds.get("publisherNm") or "").replace(" ", "")]
-        excluded, items = len(items) - len(kept), kept
-    result = {
-        "total": _total(data),
-        "datasets": [
-            {
-                "title": ds.get("title"),
-                "category": ds.get("conceptName"),
-                "creator": ds.get("creatorNm"),
-                "publisher": ds.get("publisherNm"),
-                "keywords": ds.get("keyword"),
-                "description": _short(ds.get("description"), 500),
-                "period": _period(ds),
-                "license": ds.get("license"),
-                "access": ds.get("accessRights"),
-                "page_url": ds.get("landingPage"),
-                "files": [
-                    {"name": f.get("dataNm"),
-                     "url": f.get("dataDownloadUrl") or f.get("urlOutr")}
-                    for f in (ds.get("datasetDataList") or [])
-                ],
-            }
-            for ds in items
-        ],
-    }
-    if excluded:
-        result["note"] = f"서버가 돌려준 결과 중 제공·관리기관이 '{creator}'가 아닌 {excluded}건을 뺐음 (total은 서버 기준)"
-    return result
+    items = _analysis_datasets(max_age=0)
+    return {"total": len(items), "datasets": [_dataset_view(ds) for ds in items]}
 
 
-@mcp.tool()
-@_safe
-def raw_response(api: str, query: str) -> str:
-    """[점검용] API 원본 응답을 그대로 본다. api는 'search' 또는 'dataset'.
-    다른 도구 결과가 계속 비어 있을 때만 사용해서 응답 구조를 확인할 것."""
-    import json
-    if api == "search":
-        data = _call(SEARCH_URL, {"page": 1, "perPage": 3, "searchQuery": query})
-    else:
-        data = _call(DATASET_URL, {"page": 1, "perPage": 3, "title": query})
-    return json.dumps(data, ensure_ascii=False, indent=2)[:4000]
+if os.environ.get("MOLIT_DEBUG"):
+    # 개발자 점검용. AI가 평소 탐색에 끌어다 쓰지 않도록 MOLIT_DEBUG를 켰을 때만 도구로 등록함.
+    @mcp.tool()
+    @_safe
+    def raw_response(api: Literal["search", "dataset"], query: str) -> str:
+        """[개발자 점검용] API 원본 응답을 그대로 본다. 데이터 탐색에는 쓰지 말 것."""
+        import json
+        if api == "search":
+            data = _call(SEARCH_URL, {"page": 1, "perPage": 3, "searchQuery": query})
+        else:
+            data = _call(DATASET_URL, {"page": 1, "perPage": 3, "title": query})
+        return json.dumps(data, ensure_ascii=False, indent=2)[:4000]
 
 
 # ───────────── 탐색 시작용 프롬프트 ─────────────
@@ -237,10 +317,10 @@ def contest_ideas(theme: str) -> str:
     """공모전 아이디어 탐색을 시작하는 프롬프트."""
     return f"""'{theme}'을(를) 주제로 국토교통 데이터 공모전 아이디어를 찾아줘.
 
-1. search_data로 '{theme}'와 관련 단어들을 검색해 후보 데이터를 넓게 모아.
+1. search_data로 '{theme}'와 관련 단어들을 한 단어씩 검색해 후보 데이터를 넓게 모아.
    결과에 나온 키워드를 다음 검색어로 써서 최소 5번 이상 넓혀가.
 2. 서로 엮을 수 있어 보이는 데이터는 검색 결과의 url(상세 페이지)에서 기간·지역 단위·라이선스를 확인해.
-   (get_dataset은 분석센터 등록 데이터셋 5건만 조회되므로 검색 결과 확인에는 쓰지 말 것)
+   (list_analysis_datasets는 별개의 작은 목록이라 검색 결과의 상세 확인에는 쓸 수 없음)
 3. 데이터 2~3개를 조합한 아이디어 3개를 제안해. 각 아이디어마다:
    - 어떤 데이터를 무엇을 기준으로(시간·위치·지역코드 등) 합치는지
    - 그걸로 풀 수 있는 문제와 결과물(분석/서비스)
