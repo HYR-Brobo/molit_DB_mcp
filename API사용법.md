@@ -1,3 +1,4 @@
+국토교통부 데이터통합채널 협력형 분석센터의 https://data.molit.go.kr/anals/open-api/apiView/1, https://data.molit.go.kr/anals/open-api/apiView/2 api 설명 마크다운화
 # 통합검색 조회 API
 
 | 항목 | 내용 | 항목 | 내용 |
