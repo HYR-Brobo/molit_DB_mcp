@@ -6,6 +6,7 @@ AI(Claude)가 국토부 데이터를 스스로 검색·조회하며 공모전 �
 인증키:     환경변수 MOLIT_KEY (MCP 등록할 때 같이 넣어줌)
 """
 
+import contextvars
 import functools
 import os
 import time
@@ -15,9 +16,11 @@ import requests
 from pydantic import Field
 
 try:                                            # mcp 2.x
-    from mcp.server.mcpserver import MCPServer as Server
+    from mcp.server.mcpserver import MCPServer as _BaseServer
+    from mcp.server.mcpserver.exceptions import ToolError
 except ImportError:                             # mcp 1.x
-    from mcp.server.fastmcp import FastMCP as Server
+    from mcp.server.fastmcp import FastMCP as _BaseServer
+    from mcp.server.fastmcp.exceptions import ToolError
 
 # openapi.molit.go.kr은 DNS가 127.0.0.1을 돌려줘서 어디서든 접속 거부됨. 실제 API는 여기.
 HOST = "data.molit.go.kr"
@@ -32,6 +35,28 @@ Category = Literal["국토도시", "주택토지", "교통물류", "항공", "�
 DataType = Literal["dataset", "dataservice", "all"]
 PER_PAGE = 20
 
+# 도구 이름을 바꾸면, 이미 연결돼 있던 커넥터는 옛 도구 목록을 그대로 들고 옛 이름으로 호출한다.
+# (--web은 stateless라 '목록이 바뀌었다'는 알림을 보낼 수 없음) 그래서 옛 이름도 받아서 새 도구로 넘긴다.
+RENAMED_TOOLS = {"get_dataset": "list_analysis_datasets"}
+REMOVED_TOOLS = {"raw_response": "개발자 점검용이라 평소에는 꺼 둔 도구입니다(서버에 MOLIT_DEBUG를 넣어야 켜짐). 데이터 탐색에는 필요 없습니다."}
+REFRESH_TIP = "이 커넥터가 옛 도구 목록을 보고 있으니, 사용자에게 커넥터를 껐다 켜거나 다시 연결해 도구 목록을 새로 받으라고 알려 주세요."
+_called_as = contextvars.ContextVar("called_as", default=None)
+
+
+class Server(_BaseServer):
+    async def call_tool(self, name, arguments, *args, **kwargs):
+        known = {t.name for t in await self.list_tools()}
+        if name not in known:
+            if name in RENAMED_TOOLS:
+                # 옛 인자(title·creator·page)는 새 도구에 없으므로 버린다. 목록이 몇 건뿐이라 통째로 줘도 됨.
+                _called_as.set(name)
+                name, arguments = RENAMED_TOOLS[name], {}
+            else:
+                why = REMOVED_TOOLS.get(name, "이 서버에 없는 도구입니다.")
+                raise ToolError(f"'{name}': {why} 지금 쓸 수 있는 도구: {', '.join(sorted(known))}. {REFRESH_TIP}")
+        return await super().call_tool(name, arguments, *args, **kwargs)
+
+
 mcp = Server(
     "molit-data",
     instructions="""국토교통 협력형 분석센터(data.molit.go.kr)의 데이터 '목록'을 찾는 도구. 데이터 값은 주지 않고 설명(메타데이터)만 준다.
@@ -40,12 +65,19 @@ mcp = Server(
 1. 통합 목록 (1만 건 이상) → search_data
    공공기관 데이터셋·Open API 전체. 제목·설명·기관·키워드·상세페이지 주소까지만 나온다.
    기간·라이선스·파일은 API에 없으므로 결과의 url(상세 페이지)에서 확인해야 한다.
+   이 목록은 '어디에 있는지' 알려주는 카탈로그다. 파일은 분석센터가 아니라 원래 제공기관 포털에 있고,
+   상세 페이지의 '랜딩페이지 URL'이 그 주소다.
 2. 분석 데이터셋 목록 (몇 건뿐) → list_analysis_datasets
    분석과제를 수행한 기관이 과제에 쓴 데이터를 직접 올려 둔 것. 파일 다운로드 주소·라이선스가 나온다.
    통합 목록의 '상세 조회'가 아니다. 통합 목록에서 찾은 제목은 대부분 여기에 없다.
 
 쓰는 순서: search_data로 한 단어씩 검색하며 후보를 모은다 → 결과에 analysis_dataset이 붙은 항목만 파일까지 바로 받을 수 있고,
-나머지는 url을 사용자에게 안내한다. 결과가 0건이면 도구 고장이 아니라 그 목록에 없는 것이니, 응답의 hint를 따른다.""",
+나머지는 url을 사용자에게 안내한다. 결과가 0건이면 도구 고장이 아니라 그 목록에 없는 것이니, 응답의 hint를 따른다.
+
+url(상세 페이지)을 직접 열 때 알아둘 것:
+- 자바스크립트로 그려지는 화면이라 curl·단순 fetch로는 빈 껍데기만 온다. 브라우저 도구가 있어야 내용이 보인다.
+- 상세 페이지에도 파일은 대개 없고 제공기관 포털로 가는 링크만 있다. 그 포털은 로그인·활용신청·이용 설문을 요구하는 경우가 많다.
+  그런 단계는 우회하거나 임의로 채우지 말고, 어느 포털에서 무엇을 받으면 되는지 사용자에게 안내한다.""",
 )
 
 
@@ -235,6 +267,7 @@ def search_data(
 
     돌려주는 것: 제목·분야·기관·키워드·설명·상세페이지 주소(url). 데이터 '값'은 주지 않는다.
     돌려주지 않는 것: 기간·라이선스·파일. API에 없으므로 url의 상세 페이지에서 확인해야 한다.
+      (상세 페이지는 브라우저로만 읽히고, 파일은 거기 적힌 제공기관 포털에 있다. 받는 방법은 사용자에게 안내한다.)
       예외로, 결과에 analysis_dataset이 붙어 있으면 그 항목은 파일 주소·라이선스가 그 안에 이미 들어 있다.
 
     검색 요령: 한 단어로 시작해 결과의 keywords에서 다음 검색어를 골라 넓혀간다 (통학 → 셔틀 → 환승 → 정류장).
@@ -294,7 +327,11 @@ def list_analysis_datasets() -> dict:
     - 원본 포털을 가리키는 항목: 파일은 없고 original_page(공공데이터포털 등)와 라이선스가 있음.
     """
     items = _analysis_datasets(max_age=0)
-    return {"total": len(items), "datasets": [_dataset_view(ds) for ds in items]}
+    out = {"total": len(items), "datasets": [_dataset_view(ds) for ds in items]}
+    old = _called_as.get()
+    if old:
+        out["notice"] = f"'{old}'은(는) list_analysis_datasets로 이름이 바뀌었고 인자를 받지 않습니다. 전체 목록을 돌려줍니다. {REFRESH_TIP}"
+    return out
 
 
 if os.environ.get("MOLIT_DEBUG"):
