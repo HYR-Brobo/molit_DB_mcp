@@ -149,6 +149,34 @@ def _safe(fn):
     return wrapper
 
 
+# 결과 목록 자체는 비어 있어도 남긴다(0건이라는 사실이 정보다).
+_KEEP_EMPTY = {"results", "items", "datasets"}
+
+
+def _prune(v):
+    """None·빈 문자열·빈 목록인 필드를 뺀다. 숫자 0과 False는 남긴다."""
+    if isinstance(v, dict):
+        out = {}
+        for k, x in v.items():
+            x = _prune(x)
+            if k in _KEEP_EMPTY or x not in (None, "", [], {}):
+                out[k] = x
+        return out
+    if isinstance(v, list):
+        return [_prune(x) for x in v]
+    return v
+
+
+def _compact(fn):
+    """도구 응답을 공백 없는 JSON 한 줄로 보낸다. MCP 서버 기본 변환(indent=2)은 들여쓰기만으로 토큰을 15%쯤 더 쓴다.
+    @mcp.tool(structured_output=False)와 같이 써야 같은 내용이 structuredContent로 한 번 더 가지 않는다."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        out = fn(*args, **kwargs)
+        return out if isinstance(out, str) else json.dumps(_prune(out), ensure_ascii=False, separators=(",", ":"))
+    return wrapper
+
+
 def _items(data: dict) -> list:
     """응답 계층이 문서상 애매해서, 결과 리스트가 있을 법한 자리를 차례로 찾음."""
     for path in (("items",), ("body", "items"), ("data",), ("response", "body", "items")):
@@ -259,13 +287,10 @@ def _dataservice_urls(query: str, categories) -> set | None:
     return {it.get("detailPage") for it in items}
 
 
-NEXT_STEP = ("쓸 만한 후보의 url을 get_detail에 넣으면 원본 포털·파일 목록·저작권·받는 방법(how_to_get)과 "
-             "유사 데이터(related: 다른 집계 단위·다른 등록본·함께 쓸 데이터)가 나온다. "
-             f"답변에서 추천하거나 받는 방법을 안내할 데이터만 확인하되, 여러 개면 urls 인자에 리스트로 한 번에 넣는다(최대 {DETAIL_MAX}개). "
-             "variants·related의 다른 등록본·집계 단위를 대신 추천할 때는 그것도 확인하고, 받는 방법·저작권·기간이 같다고 추정하지 않는다. "
-             "자동승인인 Open API도 활용신청 등 how_to_get의 절차는 생략하지 말고 안내한다. "
-             "get_detail이 도구 목록에 이름만 있으면 먼저 불러와서 쓴다. "
-             "도구 목록에 아예 없으면 없다고 결론 내지 말고, 사용자에게 커넥터를 껐다 켜거나 다시 연결해 도구 목록을 새로 받으라고 알린다.")
+# 검색할 때마다 붙으므로 짧게 둔다. 확인 범위·related·활용신청 안내 같은 규칙은 get_detail 설명과 서버 안내문에 있다.
+# 지연 로딩 대비 문장만은 응답 본문에 남긴다(안내문은 재연결 전에는 갱신되지 않음, README 참고).
+NEXT_STEP = (f"추천·안내할 후보만 url을 get_detail의 urls에 묶어(최대 {DETAIL_MAX}개) 받는 곳·파일·저작권을 확인한다. "
+             "get_detail이 이름만 있으면 불러와 쓰고, 아예 없으면 사용자에게 커넥터 재연결을 안내한다.")
 
 # 같은 데이터가 원본 포털판·공공데이터포털 이관판('기관명_' 접두어)·파일판('(FILE)')·'OpenAPI 조회' 껍데기로 여러 번 등록돼 있다.
 # 제목에서 이 꼬리표만 떼고 같으면 하나로 묶는다. '(15분 단위)'·'(1시간 단위)'처럼 내용이 다른 꼬리표는 떼지 않는다.
@@ -326,7 +351,8 @@ def _search_hint(query: str, total, page: int, narrowed: bool) -> str:
 
 
 # ───────────── AI가 쓰는 도구 ─────────────
-@mcp.tool()
+@mcp.tool(structured_output=False)
+@_compact
 @_safe
 def search_data(
     query: Annotated[str, Field(description="검색어. 한 단어 권장(예: '환승'). 띄어 쓰면 단어 중 하나만 맞아도 걸려 결과가 폭증함.")],
@@ -398,8 +424,7 @@ def search_data(
     total = _total(data)
     out = {"query": query, "page": page, "total": total, "results": results}
     if merged:
-        out["grouped"] = (f"같은 데이터의 다른 등록본 {merged}건을 각 항목의 variants에 묶음. "
-                          "과거 이력을 한꺼번에 받으려면 파일형, 실시간·최신값이면 Open API형 등록본을 고른다.")
+        out["grouped"] = f"다른 등록본 {merged}건을 variants에 묶음. 과거 이력은 파일형, 실시간·최신값은 Open API형 등록본."
     hint = _search_hint(query, total, page, bool(categories or data_types))
     if hint:
         out["hint"] = hint
@@ -558,11 +583,8 @@ def _related(res: dict, seq: str) -> list:
     return out
 
 
-RELATED_HINT = ("related는 사이트가 꼽은 미검증 후보다. relationship이 '같은 데이터의 다른 집계 단위'면, "
-                "이 항목의 단위·기간이 필요한 것과 다를 때 '그런 데이터는 없다'고 결론 내기 전에 그 항목을 상세 조회한다. "
-                "다른 등록본·유사도 100도 같은 데이터라는 보장은 없고 받는 방법·라이선스·기간이 다를 수 있다. "
-                "related 전부를 열 필요는 없다: 답변에서 추천하거나 받는 방법을 안내할 것만 urls로 묶어 상세 조회하고, "
-                "결합할 데이터는 기간·집계 단위가 맞는지 확인한다.")
+RELATED_HINT = ("related는 사이트가 꼽은 미검증 후보. 단위·기간이 안 맞으면 없다고 결론 내기 전에 '다른 집계 단위'를 확인하고, "
+                "다른 등록본도 받는 방법·라이선스·기간은 따로 확인한다. 추천·안내할 것만 urls로 묶어 조회.")
 
 
 # ───────────── Open API형 명세 확인 ─────────────
@@ -746,7 +768,8 @@ def _api_how(portal: str, rights, spec: dict) -> str:
             f"'{portal}'의 landing_page에서 활용신청과 명세 확인을 하도록 사용자에게 안내한다{approval}.")
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
+@_compact
 @_safe
 def get_detail(
     url: Annotated[str | list[str] | None, Field(
@@ -778,7 +801,6 @@ def get_detail(
         out = _detail_one(inputs[0])
         if out.get("related"):
             out["related_hint"] = RELATED_HINT
-        out["batch_hint"] = f"추가 후보가 있으면 get_detail의 urls 인자에 리스트로 모아 한 번에 조회(최대 {DETAIL_MAX}개)."
         return out
     items = []
     for u in inputs[:DETAIL_MAX]:
@@ -853,7 +875,7 @@ def _detail_one(url: str) -> dict:
         "landing_page": landing,
         "files": files,
         "how_to_get": how,
-        "url": _detail_url(seq),
+        "id": seq,      # 상세 url은 호출한 쪽이 이미 갖고 있다. 묶음 응답에서 항목을 맞춰 볼 id만 둔다.
     }
     if spec is not None:
         out["api_spec"] = spec
@@ -863,7 +885,8 @@ def _detail_one(url: str) -> dict:
     return out
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
+@_compact
 @_safe
 def list_analysis_datasets() -> dict:
     """분석과제에 쓰인 뒤 분석센터에 따로 올라온 '분석 데이터셋'을 전부 보여준다(몇 건뿐이라 검색어 없이 통째로).
@@ -886,7 +909,7 @@ def list_analysis_datasets() -> dict:
 
 if os.environ.get("MOLIT_DEBUG"):
     # 개발자 점검용. AI가 평소 탐색에 끌어다 쓰지 않도록 MOLIT_DEBUG를 켰을 때만 도구로 등록함.
-    @mcp.tool()
+    @mcp.tool(structured_output=False)
     @_safe
     def raw_response(api: Literal["search", "dataset"], query: str) -> str:
         """[개발자 점검용] API 원본 응답을 그대로 본다. 데이터 탐색에는 쓰지 말 것."""

@@ -31,6 +31,16 @@
 자동승인인 API도 `how_to_get`에 있는 활용신청 등의 절차를 안내해야 한다.
 새 `urls` 인자를 도구 목록에 반영하려면 서버 재시작 후 커넥터를 다시 연결한다.
 
+## 응답 크기
+도구 응답은 AI의 컨텍스트에 그대로 쌓이므로 짧게 보낸다.
+- 응답은 공백 없는 JSON 한 줄이다(`_compact`). MCP 서버 기본 변환은 `indent=2`라 들여쓰기만으로 토큰을 15%쯤 더 쓴다.
+  `structured_output=False`로 등록해 같은 내용이 `structuredContent`로 한 번 더 가지 않게 한다.
+- 값이 없는 필드(`null`·`""`·빈 목록)는 뺀다. `results`·`items`·`datasets`는 비어도 남긴다.
+- `get_detail` 항목에는 상세 url 대신 `id`만 넣는다(호출한 쪽이 url을 이미 갖고 있음). `related`의 `url`은 다음 조회에 쓰므로 그대로 둔다.
+- 검색마다 붙는 `next_step`은 두 문장만 둔다. 확인 범위·related·활용신청 규칙은 도구 설명과 서버 안내문에 있다.
+
+2026-11 측정(o200k 토크나이저 기준): `search_data` 20건 5,732 → 4,947, `get_detail` 4건 묶음 3,409 → 2,787, 1건 975 → 718.
+
 ## Open API형의 `api_spec`
 Open API형(`type`이 `Open API형`)이면 `get_detail`이 원본 포털의 페이지(`landing_page`)를 열어 `api_spec`을 붙인다.
 원본 페이지 구조가 포털·등록 방식마다 달라서(2026-11, 68건 측정) 명세를 뽑을 수 있을 때만 뽑고, 못 뽑으면 이유를 `status`·`note`로 알린다.
