@@ -53,6 +53,12 @@ _called_as = contextvars.ContextVar("called_as", default=None)
 
 class Server(_BaseServer):
     async def call_tool(self, name, arguments, *args, **kwargs):
+        # get_detail의 옛 인자 url은 urls로 합쳤다. 옛 도구 목록을 든 커넥터가 url로 불러도 받아 준다.
+        if name == "get_detail" and isinstance(arguments, dict) and "url" in arguments:
+            arguments = dict(arguments)
+            old = arguments.pop("url")
+            if old is not None and not arguments.get("urls"):
+                arguments["urls"] = old
         known = {t.name for t in await self.list_tools()}
         if name not in known:
             if name in RENAMED_TOOLS:
@@ -638,6 +644,28 @@ def _param_line(p: dict) -> str:
     return f"{p.get('name')}: {desc}" if desc else str(p.get("name"))
 
 
+_SPEC_LISTS = ("required", "optional", "response_fields")
+
+
+def _fold_ops(ops: list) -> list:
+    """지역별·기간별로 쪼갠 API는 operation마다 같은 파라미터·응답 필드를 되풀이한다(예: 교통카드 합성데이터 9개 지역).
+    앞에 나온 operation과 이름 목록이 같으면 목록을 빼고 same_params_as에 그 path만 남긴다.
+    설명은 비교하지 않는다: 같은 파라미터인데 설명만 잘린 길이가 다른 경우가 있다."""
+    def names(row):
+        return tuple(tuple(x.split(":", 1)[0] for x in row.get(k) or []) for k in _SPEC_LISTS)
+    seen, out = {}, []
+    for row in ops:
+        key = names(row)
+        if not any(key):
+            out.append(row)
+        elif key in seen:
+            out.append({**{k: v for k, v in row.items() if k not in _SPEC_LISTS}, "same_params_as": seen[key]})
+        else:
+            seen[key] = row["path"]
+            out.append(row)
+    return out
+
+
 def _swagger_spec(s: dict) -> dict | None:
     """Swagger 2.0 / OpenAPI 3 문서 → 호출에 필요한 것만. 경로나 주소가 비어 있으면 None(LINK형이 빈 껍데기를 싣는 경우)."""
     paths = s.get("paths") or {}
@@ -676,7 +704,7 @@ def _swagger_spec(s: dict) -> dict | None:
             ops.append(row)
     if not ops:
         return None
-    out = {"base_url": base, "operations": ops[:SPEC_MAX_OPS]}
+    out = {"base_url": base, "operations": _fold_ops(ops[:SPEC_MAX_OPS])}
     if len(ops) > SPEC_MAX_OPS:
         out["operations_omitted"] = len(ops) - SPEC_MAX_OPS
     return out
@@ -772,11 +800,9 @@ def _api_how(portal: str, rights, spec: dict) -> str:
 @_compact
 @_safe
 def get_detail(
-    url: Annotated[str | list[str] | None, Field(
-        description="기존 호출 호환용: 상세 url 또는 숫자 id 하나(기존 리스트도 지원). 여러 후보는 urls를 사용. urls와 동시에 지정하지 않는다.")] = None,
-    urls: Annotated[list[str] | None, Field(
-        description="권장: search_data·related·variants에서 고른 상세 url(…/data-search/detail/숫자) 또는 숫자 id 목록. "
-                    f"여러 후보를 한 번에 확인(최대 {DETAIL_MAX}개). url과 동시에 지정하지 않는다.")] = None,
+    urls: Annotated[list[str] | str, Field(
+        description="search_data·related·variants에서 고른 상세 url(…/data-search/detail/숫자) 또는 숫자 id. "
+                    f"확인할 후보를 모두 리스트로 한 번에 넣는다(최대 {DETAIL_MAX}개). 한 건씩 여러 번 부르지 않는다.")],
 ) -> dict:
     """search_data에서 고른 항목의 상세 페이지 내용을 본다. 상세 페이지를 브라우저·curl로 직접 여는 대신 이걸 쓴다.
 
@@ -787,17 +813,16 @@ def get_detail(
     어떤 조건으로 무엇을 조회할 수 있는지 판단할 수 있다. 그 밖의 status(html·link·no_content·elsewhere·not_found·unreachable)는
     명세를 자동으로 못 뽑은 것이니 note대로 안내하고, 파라미터·코드값을 짐작해서 채우지 않는다. 인증키는 사용자가 활용신청으로 받아야 한다.
 
-    urls=[...]를 쓰면 한 항목이어도 {count, items:[...]}로 돌려준다. 기존 url은 한 항목이면 단일 상세 응답을 유지한다.
+    한 건이면 상세 하나를, 여러 건이면 {count, items:[...]}를 돌려준다.
+    api_spec의 operation에 same_params_as가 있으면 그 path의 operation과 파라미터·응답 필드가 같다.
     답변에서 추천하거나 받는 방법을 안내할 데이터는 검색 결과 설명만 믿지 말고 여기서 확인한다 (urls로 한 번에).
     related·variants는 전부 열 필요 없다. 그중 추천·안내할 것만 확인하고, 다른 등록본·집계 단위의 받는 방법·저작권·기간을 그대로 적용하지 않는다.
     related의 relationship이 '같은 데이터의 다른 집계 단위'면, 원하는 단위·기간이 없다고 결론 내기 전에 그 항목을 확인한다.
     """
-    if url is not None and urls is not None:
-        return {"error": "url과 urls는 동시에 지정할 수 없음. 여러 후보는 urls에 모아 주세요."}
-    inputs = _as_urls(urls if urls is not None else url) if (urls is not None or url is not None) else []
+    inputs = _as_urls(urls)
     if not inputs:
-        return {"error": "url 또는 urls가 비어 있음. search_data 결과의 url을 넣어 주세요."}
-    if urls is None and len(inputs) == 1:
+        return {"error": "urls가 비어 있음. search_data 결과의 url을 넣어 주세요."}
+    if len(inputs) == 1:
         out = _detail_one(inputs[0])
         if out.get("related"):
             out["related_hint"] = RELATED_HINT
