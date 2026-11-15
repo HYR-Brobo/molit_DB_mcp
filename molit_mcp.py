@@ -7,8 +7,10 @@ AI(Claude)가 국토부 데이터를 스스로 검색·조회하며 공모전 �
 """
 
 import contextvars
+import datetime
 import functools
 import os
+import re
 import time
 from typing import Annotated, Literal
 
@@ -29,6 +31,8 @@ SEARCH_URL = "/search/getOpenApiSearchList"
 DATASET_URL = "/dataset/getOpenApiDatasetList"
 # https 먼저, 안 되면 http. 둘 다 실패하면 각각의 실패 이유를 함께 돌려줌.
 SCHEMES = ("https", "http")
+# 상세 페이지 화면이 쓰는 사이트 내부 API. 인증키 없이 POST로 부름.
+DETAIL_URL = f"https://{HOST}/api/search/analsDetail"
 KEY = os.environ.get("MOLIT_KEY", "")
 
 Category = Literal["국토도시", "주택토지", "교통물류", "항공", "도로철도", "일반", "융합(기타)"]
@@ -64,20 +68,18 @@ mcp = Server(
 목록이 두 개이고 서로 크기가 전혀 다르다:
 1. 통합 목록 (1만 건 이상) → search_data
    공공기관 데이터셋·Open API 전체. 제목·설명·기관·키워드·상세페이지 주소까지만 나온다.
-   기간·라이선스·파일은 API에 없으므로 결과의 url(상세 페이지)에서 확인해야 한다.
-   이 목록은 '어디에 있는지' 알려주는 카탈로그다. 파일은 분석센터가 아니라 원래 제공기관 포털에 있고,
-   상세 페이지의 '랜딩페이지 URL'이 그 주소다.
+   파일 목록·원본 포털·저작권은 결과의 url을 get_detail에 넣으면 나온다.
+   이 목록은 '어디에 있는지' 알려주는 카탈로그다. 파일은 분석센터가 아니라 원래 제공기관 포털에 있다.
 2. 분석 데이터셋 목록 (몇 건뿐) → list_analysis_datasets
    분석과제를 수행한 기관이 과제에 쓴 데이터를 직접 올려 둔 것. 파일 다운로드 주소·라이선스가 나온다.
    통합 목록의 '상세 조회'가 아니다. 통합 목록에서 찾은 제목은 대부분 여기에 없다.
 
-쓰는 순서: search_data로 한 단어씩 검색하며 후보를 모은다 → 결과에 analysis_dataset이 붙은 항목만 파일까지 바로 받을 수 있고,
-나머지는 url을 사용자에게 안내한다. 결과가 0건이면 도구 고장이 아니라 그 목록에 없는 것이니, 응답의 hint를 따른다.
+쓰는 순서: search_data로 한 단어씩 검색하며 후보를 모은다 → 쓸 만한 후보만 get_detail로 파일 목록·받는 곳을 확인한다.
+결과가 0건이면 도구 고장이 아니라 그 목록에 없는 것이니, 응답의 hint를 따른다.
 
-url(상세 페이지)을 직접 열 때 알아둘 것:
-- 자바스크립트로 그려지는 화면이라 curl·단순 fetch로는 빈 껍데기만 온다. 브라우저 도구가 있어야 내용이 보인다.
-- 상세 페이지에도 파일은 대개 없고 제공기관 포털로 가는 링크만 있다. 그 포털은 로그인·활용신청·이용 설문을 요구하는 경우가 많다.
-  그런 단계는 우회하거나 임의로 채우지 말고, 어느 포털에서 무엇을 받으면 되는지 사용자에게 안내한다.""",
+상세 페이지(url)는 자바스크립트 화면이라 curl·fetch로 열면 빈 껍데기만 온다. 직접 열지 말고 get_detail을 쓴다.
+파일은 대개 제공기관 포털에 있고, 그 포털은 로그인·활용신청·이용 설문을 요구하는 경우가 많다.
+그런 단계는 우회하거나 임의로 채우지 말고, get_detail의 how_to_get대로 어느 포털에서 무엇을 받으면 되는지 사용자에게 안내한다.""",
 )
 
 
@@ -266,8 +268,7 @@ def search_data(
     """통합 목록(1만 건 이상)에서 국토교통 데이터를 키워드로 찾는다. 데이터를 찾을 때 항상 이 도구부터 쓴다.
 
     돌려주는 것: 제목·분야·기관·키워드·설명·상세페이지 주소(url). 데이터 '값'은 주지 않는다.
-    돌려주지 않는 것: 기간·라이선스·파일. API에 없으므로 url의 상세 페이지에서 확인해야 한다.
-      (상세 페이지는 브라우저로만 읽히고, 파일은 거기 적힌 제공기관 포털에 있다. 받는 방법은 사용자에게 안내한다.)
+    돌려주지 않는 것: 파일 목록·원본 포털·저작권. 필요한 후보만 결과의 url을 get_detail에 넣어 확인한다.
       예외로, 결과에 analysis_dataset이 붙어 있으면 그 항목은 파일 주소·라이선스가 그 안에 이미 들어 있다.
 
     검색 요령: 한 단어로 시작해 결과의 keywords에서 다음 검색어를 골라 넓혀간다 (통학 → 셔틀 → 환승 → 정류장).
@@ -313,6 +314,113 @@ def search_data(
     return out
 
 
+def _date(ms) -> str:
+    """밀리초 타임스탬프 → 'YYYY-MM-DD' (한국 시간)."""
+    if not ms:
+        return ""
+    try:
+        kst = datetime.timezone(datetime.timedelta(hours=9))
+        return datetime.datetime.fromtimestamp(int(ms) / 1000, kst).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def _size(n) -> str:
+    if not n:
+        return ""
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return ""
+
+
+def _detail_call(seq: str) -> dict:
+    body = {"resourceSeq": seq, "siteCode": "molit_anals", "algrthId": "1", "simildegerPt": 50,
+            "simildegerSort": None, "hitResourceSort": None, "startRow": 0, "rowsPerPage": 10}
+    try:
+        r = requests.post(DETAIL_URL, json=body, timeout=20,
+                          headers={"Accept": "application/json", "Referer": f"https://{HOST}/anals/data-search/detail/{seq}"})
+    except requests.RequestException as e:
+        raise RuntimeError(f"상세 정보 서버에 연결하지 못함: {type(e).__name__}: {e}")
+    if r.status_code >= 400:
+        raise RuntimeError(f"상세 정보 HTTP {r.status_code}: {r.text[:300]}")
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError(f"상세 정보 응답이 JSON이 아님: {r.text[:300]}")
+    if not data.get("success") or not isinstance(data.get("result"), dict):
+        raise RuntimeError(f"상세 정보 조회 실패: {data.get('message') or str(data)[:300]}")
+    return data["result"]
+
+
+@mcp.tool()
+@_safe
+def get_detail(
+    url: Annotated[str, Field(description="search_data 결과의 url(…/data-search/detail/숫자) 또는 그 끝의 숫자 id.")],
+) -> dict:
+    """search_data에서 고른 항목 하나의 상세 페이지 내용을 본다. 상세 페이지를 브라우저·curl로 직접 여는 대신 이걸 쓴다.
+
+    돌려주는 것: 원본 포털 이름·주소, 파일 목록(제목·형식·크기·수정일·주소), 저작권, how_to_get(받는 방법).
+    파일 '내용'은 주지 않는다. 대부분 파일은 제공기관 포털에 있고, 그 포털이 로그인·설문을 요구하면 사용자에게 안내한다.
+    """
+    m = re.search(r"(\d+)\D*$", url.strip())
+    if not m:
+        return {"error": "url에서 id(끝의 숫자)를 찾지 못함. search_data 결과의 url을 그대로 넣어 주세요."}
+    seq = m.group(1)
+    res = _detail_call(seq)
+    resource, system, agent = res.get("resource") or {}, res.get("system") or {}, res.get("agent") or {}
+    if not resource:
+        return {"error": f"id {seq}에 해당하는 항목이 없음. search_data 결과의 url인지 확인해 주세요."}
+
+    files = []
+    for d in res.get("distributions") or []:
+        files.append({
+            "title": d.get("title"),
+            "format": d.get("format") or d.get("mediaType"),
+            "size": _size(d.get("byteSize")),
+            "modified": _date(d.get("modified")),
+            "download_url": d.get("downloadUrl"),
+            "page_url": d.get("accessUrl"),
+        })
+    for d in res.get("datasetDatas") or []:      # 분석센터에 직접 올라온 파일
+        link = d.get("dataDownloadUrl") or d.get("dataUrl") or d.get("urlOutr")
+        if d.get("dataNm") or link:
+            files.append({"title": d.get("dataNm"), "format": d.get("dataFormat") or d.get("format"),
+                          "download_url": link, "page_url": None})
+
+    landing = resource.get("landingPage")
+    portal = system.get("sysNm") or agent.get("agentName")
+    direct = [f for f in files if f["download_url"]]
+    if direct:
+        how = "files의 download_url로 바로 받을 수 있음"
+    elif files and landing:
+        how = (f"파일 {len(files)}개가 '{portal}'에 있음. landing_page(또는 각 파일의 page_url)에서 받아야 함. "
+               "로그인·활용신청·이용 설문을 요구할 수 있으니 사용자에게 안내할 것.")
+    elif landing:
+        how = f"등록된 파일 목록은 없음. '{portal}'의 landing_page에서 확인해야 함 (Open API형이면 거기서 활용신청)."
+    else:
+        how = "받을 수 있는 경로가 등록돼 있지 않음"
+
+    return {
+        "title": resource.get("title"),
+        "type": {"dataset": "파일형", "dataservice": "Open API형"}.get(resource.get("type"), resource.get("type")),
+        "category": resource.get("conceptName"),
+        "agency": agent.get("agentName"),
+        "description": _short(resource.get("description"), 500),
+        "keywords": ", ".join(k.get("keyword", "") for k in res.get("keywords") or []),
+        "modified": _date(resource.get("modified")),
+        "license": resource.get("license") or "미기재",
+        "rights": resource.get("rights"),
+        "portal": portal,
+        "landing_page": landing,
+        "files": files,
+        "how_to_get": how,
+        "url": f"https://{HOST}/anals/data-search/detail/{seq}",
+    }
+
+
 @mcp.tool()
 @_safe
 def list_analysis_datasets() -> dict:
@@ -356,7 +464,7 @@ def contest_ideas(theme: str) -> str:
 
 1. search_data로 '{theme}'와 관련 단어들을 한 단어씩 검색해 후보 데이터를 넓게 모아.
    결과에 나온 키워드를 다음 검색어로 써서 최소 5번 이상 넓혀가.
-2. 서로 엮을 수 있어 보이는 데이터는 검색 결과의 url(상세 페이지)에서 기간·지역 단위·라이선스를 확인해.
+2. 서로 엮을 수 있어 보이는 데이터는 get_detail에 url을 넣어 파일 목록·받는 곳·저작권을 확인해.
    (list_analysis_datasets는 별개의 작은 목록이라 검색 결과의 상세 확인에는 쓸 수 없음)
 3. 데이터 2~3개를 조합한 아이디어 3개를 제안해. 각 아이디어마다:
    - 어떤 데이터를 무엇을 기준으로(시간·위치·지역코드 등) 합치는지
