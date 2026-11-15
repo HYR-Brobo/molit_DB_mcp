@@ -9,11 +9,13 @@ AI(Claude)가 국토부 데이터를 스스로 검색·조회하며 공모전 �
 import contextvars
 import datetime
 import functools
+import html as _html
 import json
 import os
 import re
 import time
 from typing import Annotated, Literal
+from urllib.parse import urlparse
 
 import requests
 from pydantic import Field
@@ -82,7 +84,11 @@ mcp = Server(
 
 상세 페이지(url)는 자바스크립트 화면이라 curl·fetch로 열면 빈 껍데기만 온다. 직접 열지 말고 get_detail을 쓴다.
 파일은 대개 제공기관 포털에 있고, 그 포털은 로그인·활용신청·이용 설문을 요구하는 경우가 많다.
-그런 단계는 우회하거나 임의로 채우지 말고, get_detail의 how_to_get대로 어느 포털에서 무엇을 받으면 되는지 사용자에게 안내한다.""",
+그런 단계는 우회하거나 임의로 채우지 말고, get_detail의 how_to_get대로 어느 포털에서 무엇을 받으면 되는지 사용자에게 안내한다.
+자동승인인 Open API도 활용신청은 사용자가 직접 해야 하므로 그 절차를 빠뜨리지 않는다.
+Open API형은 get_detail의 api_spec에 명세(status=swagger) 또는 명세를 못 뽑은 이유가 나온다. 이유가 나오면 짐작해 채우지 말고 그대로 안내한다.
+같은 데이터가 5분·15분·1개월처럼 집계 단위별로 따로 등록된 경우가 많다. 찾은 항목의 단위·기간이 맞지 않으면
+'없다'고 단정하기 전에 get_detail의 related에서 '같은 데이터의 다른 집계 단위'를 확인한다.""",
 )
 
 
@@ -255,8 +261,9 @@ def _dataservice_urls(query: str, categories) -> set | None:
 
 NEXT_STEP = ("쓸 만한 후보의 url을 get_detail에 넣으면 원본 포털·파일 목록·저작권·받는 방법(how_to_get)과 "
              "유사 데이터(related: 다른 집계 단위·다른 등록본·함께 쓸 데이터)가 나온다. "
-             f"답변에서 받는 방법을 말할 데이터는 전부 확인하되, 여러 개면 urls 인자에 리스트로 한 번에 넣는다(최대 {DETAIL_MAX}개). "
-             "related·variants의 다른 등록본이나 집계 단위도 각각 상세를 확인해야 하며, 받는 방법·저작권·기간이 같다고 추정하지 않는다. "
+             f"답변에서 추천하거나 받는 방법을 안내할 데이터만 확인하되, 여러 개면 urls 인자에 리스트로 한 번에 넣는다(최대 {DETAIL_MAX}개). "
+             "variants·related의 다른 등록본·집계 단위를 대신 추천할 때는 그것도 확인하고, 받는 방법·저작권·기간이 같다고 추정하지 않는다. "
+             "자동승인인 Open API도 활용신청 등 how_to_get의 절차는 생략하지 말고 안내한다. "
              "get_detail이 도구 목록에 이름만 있으면 먼저 불러와서 쓴다. "
              "도구 목록에 아예 없으면 없다고 결론 내지 말고, 사용자에게 커넥터를 껐다 켜거나 다시 연결해 도구 목록을 새로 받으라고 알린다.")
 
@@ -486,30 +493,257 @@ def _as_urls(value) -> list[str]:
     return [str(x).strip().strip('"\'') for x in items if str(x).strip().strip('"\'')]
 
 
+# 제목 끝의 괄호 꼬리표. '(5분 단위)'·'(1개월 단위)'처럼 같은 데이터를 다른 단위로 집계한 판을 가른다.
+_TAIL = re.compile(r"\(([^()]*)\)$")
+# 꼬리표가 집계 단위(시간 간격·공간 단위)를 말하는지. 아니면(예: 지역명) '다른 구분'으로만 표시한다.
+_UNIT_TAG = re.compile(r"단위|\d+\s*(분|초|시간|일|주|개월|월|년)|^(일|주|월|연|년|분기|시간)별$")
+
+
+def _split_tail(base: str) -> tuple[str, str]:
+    """_base_title 결과에서 끝 괄호 하나를 떼어 (몸통, 꼬리표)로."""
+    m = _TAIL.search(base)
+    return (base[:m.start()], m.group(1)) if m else (base, "")
+
+
+def _tail_label(title) -> str:
+    """사람이 읽을 꼬리표(띄어쓰기 유지). 없으면 '표기 없음'."""
+    m = _TAIL.search(_VARIANT_TAGS.sub("", title or "").strip())
+    return m.group(1).strip() if m else "표기 없음"
+
+
+def _relationship(mine: str, theirs: str, similarity, mine_title="", their_title="") -> dict:
+    """제목으로 관계를 가린다. 유사도 점수로는 '같은 데이터의 다른 집계 단위'와 그냥 비슷한 데이터가 구별되지 않는다
+    (예: 콘존 1개월 단위 ↔ 5분 단위가 64점). 제목은 끝의 괄호만 다르다. mine·theirs는 _base_title 결과."""
+    if mine == theirs:
+        return {"relationship": "같은 데이터의 다른 등록본"}
+    (body_a, tag_a), (body_b, tag_b) = _split_tail(mine), _split_tail(theirs)
+    if body_a and body_a == body_b and (tag_a or tag_b):
+        unit = bool(_UNIT_TAG.search(tag_a) or _UNIT_TAG.search(tag_b))
+        return {"relationship": "같은 데이터의 다른 집계 단위" if unit else "같은 데이터의 다른 구분",
+                "differs_in": f"이 항목 ({_tail_label(mine_title)}) ↔ 이것 ({_tail_label(their_title)})"}
+    # 유사도는 동일성의 증명이 아니다. 100점이어도 다른 등록본 '후보'로만 안내한다.
+    try:
+        same = float(similarity) == 100
+    except (TypeError, ValueError):
+        same = False
+    return {"relationship": "같은 데이터의 다른 등록본 후보" if same else "유사 데이터"}
+
+
+_REL_ORDER = {"같은 데이터의 다른 집계 단위": 0, "같은 데이터의 다른 구분": 1,
+              "같은 데이터의 다른 등록본": 2, "같은 데이터의 다른 등록본 후보": 3, "유사 데이터": 4}
+
+
 def _related(res: dict, seq: str) -> list:
     """사이트가 상세 화면의 '유사 데이터'로 보여주는 목록. 같은 계열의 다른 단위·다른 등록본·짝이 되는 데이터가 여기 나온다."""
+    resource, agent = res.get("resource") or {}, res.get("agent") or {}
+    mine = _base_title(resource.get("title"), agent.get("agentName"))
     out = []
     for s in res.get("simildegers") or []:
         other = s.get("similrResourceSeq")
         if not other or str(other) == seq:
             continue
-        # 유사도는 동일성의 증명이 아니다. 100점이어도 다른 등록본 '후보'로 안내한다.
-        try:
-            same = float(s.get("simildegerPt")) == 100
-        except (TypeError, ValueError):
-            same = False
-        kind = TYPE_NAMES.get(s.get("type"), "미확인")
-        kind_source = "원본 type" if kind != "미확인" else "상세 확인 필요"
-        # 현재 유사 목록은 resourceType='개방 데이터'만 주어 종류가 구분되지 않는다.
-        # 명시적인 제목 표기만 보조 단서로 쓰고, 상세 확인된 종류와 구별한다.
-        title = s.get("title") or ""
-        if kind == "미확인" and re.search(r"\(FILE\)", title, re.IGNORECASE):
-            kind, kind_source = "파일형", "제목 (FILE) 표기 기반 추정; 상세 확인 필요"
-        out.append({"title": s.get("title"), "agency": s.get("agentName"),
-                    "kind": kind, "kind_source": kind_source,
-                    "relationship": "같은 데이터의 다른 등록본 후보" if same else "유사 데이터",
-                    "similarity": s.get("simildegerPt"), "url": _detail_url(other)})
+        title, agency = s.get("title") or "", s.get("agentName")
+        row = {"title": title.strip(), "agency": agency}
+        # 유사 목록은 대개 type을 주지 않는다(resourceType='개방 데이터'뿐). 알 수 있을 때만 kind를 넣는다.
+        kind = TYPE_NAMES.get(s.get("type"))
+        if not kind and re.search(r"\(FILE\)", title, re.IGNORECASE):
+            kind = "파일형(제목의 (FILE) 표기로 추정)"
+        if kind:
+            row["kind"] = kind
+        row.update(_relationship(mine, _base_title(title, agency), s.get("simildegerPt"),
+                                 resource.get("title"), title))
+        row.update(similarity=s.get("simildegerPt"), url=_detail_url(other))
+        out.append(row)
+    out.sort(key=lambda r: _REL_ORDER.get(r["relationship"], 9))     # 같은 데이터 계열을 앞으로
     return out
+
+
+RELATED_HINT = ("related는 사이트가 꼽은 미검증 후보다. relationship이 '같은 데이터의 다른 집계 단위'면, "
+                "이 항목의 단위·기간이 필요한 것과 다를 때 '그런 데이터는 없다'고 결론 내기 전에 그 항목을 상세 조회한다. "
+                "다른 등록본·유사도 100도 같은 데이터라는 보장은 없고 받는 방법·라이선스·기간이 다를 수 있다. "
+                "related 전부를 열 필요는 없다: 답변에서 추천하거나 받는 방법을 안내할 것만 urls로 묶어 상세 조회하고, "
+                "결합할 데이터는 기간·집계 단위가 맞는지 확인한다.")
+
+
+# ───────────── Open API형 명세 확인 ─────────────
+# Open API형 랜딩 페이지는 포털·등록 방식마다 구조가 다르다. 2026-11에 68건(버스·건축물·항공·철도)을 열어 본 결과:
+#   공공데이터포털 + swaggerJson 스펙 37% · 본문 표 9% · 'LINK'형(실제 API는 외부, 스펙 없음) 24% · 삭제(404) 3%
+#   다른 포털 본문 9% · 별도 탭 4% · 자바스크립트 껍데기 12% · 접속 실패 3%
+# 그래서 스펙은 뽑을 수 있을 때만 뽑고, 못 뽑으면 왜 못 뽑는지 status로 알려 AI가 헛걸음하거나 추측하지 않게 한다.
+SPEC_TIMEOUT = 12
+SPEC_TTL = 3600
+SPEC_MAX_OPS = 10
+SPEC_MAX_FIELDS = 20
+_SPEC_CACHE: dict = {}      # landing_page → (받은 시각, 결과)
+_UA = {"User-Agent": "Mozilla/5.0 (molit-data MCP)"}
+_AUTH_PARAMS = {"servicekey", "apikey", "key", "authkey", "crtfckey"}
+# 응답 필드에서 뺄 공통 껍데기(결과코드·쪽 번호 등). 데이터 항목만 남긴다.
+_ENVELOPE = {"resultCode", "resultMsg", "numOfRows", "pageNo", "totalCount", "dataType", "header", "body", "items", "item",
+             "page", "perPage", "currentCount", "matchCount", "data"}
+
+
+def _js_template(raw: str) -> str:
+    """swaggerJson은 JS 템플릿 문자열(`…`) 안에 있다. JS가 푸는 이스케이프(\\\\ \\` \\$)를 같이 풀어야 JSON이 되는 페이지가 있다."""
+    return re.sub(r"\\([\\`$])", r"\1", raw)
+
+
+def _deref(schema, defs: dict, depth: int = 0):
+    while isinstance(schema, dict) and "$ref" in schema and depth < 10:
+        schema = defs.get(schema["$ref"].rsplit("/", 1)[-1])
+        depth += 1
+    return schema if isinstance(schema, dict) else {}
+
+
+def _leaf_fields(schema, defs: dict, out: list, depth: int = 0) -> None:
+    """응답 스키마에서 실제 데이터 항목(잎 필드)만 'name: 설명'으로 모은다."""
+    schema = _deref(schema, defs)
+    if depth > 8 or not schema:
+        return
+    if schema.get("items"):
+        _leaf_fields(schema["items"], defs, out, depth + 1)
+        return
+    for name, sub in (schema.get("properties") or {}).items():
+        sub = _deref(sub, defs)
+        if sub.get("properties") or sub.get("items"):
+            _leaf_fields(sub, defs, out, depth + 1)
+        elif name not in _ENVELOPE:
+            desc = _short(sub.get("description"), 40)
+            out.append(f"{name}: {desc}" if desc else name)
+
+
+def _param_line(p: dict) -> str:
+    desc = _short(p.get("description"), 40)
+    return f"{p.get('name')}: {desc}" if desc else str(p.get("name"))
+
+
+def _swagger_spec(s: dict) -> dict | None:
+    """Swagger 2.0 / OpenAPI 3 문서 → 호출에 필요한 것만. 경로나 주소가 비어 있으면 None(LINK형이 빈 껍데기를 싣는 경우)."""
+    paths = s.get("paths") or {}
+    if s.get("servers"):
+        base = (s["servers"][0] or {}).get("url", "")
+    elif s.get("host"):
+        schemes = s.get("schemes") or ["https"]
+        base = f"{'https' if 'https' in schemes else schemes[0]}://{s['host']}{s.get('basePath') or ''}"
+    else:
+        base = ""
+    if not paths or not base:
+        return None
+    defs = s.get("definitions") or (s.get("components") or {}).get("schemas") or {}
+    ops = []
+    for path, item in paths.items():
+        if not isinstance(item, dict):
+            continue
+        common = [p for p in item.get("parameters") or [] if isinstance(p, dict)]
+        for method, op in item.items():
+            if method.lower() not in ("get", "post", "put", "delete", "patch") or not isinstance(op, dict):
+                continue
+            params = [_deref(p, defs) for p in common + (op.get("parameters") or [])]
+            params = [p for p in params if p.get("name") and p["name"].lower() not in _AUTH_PARAMS]
+            row = {"method": method.upper(), "path": path,
+                   "summary": op.get("summary") or _short(op.get("description"), 80),
+                   "required": [_param_line(p) for p in params if p.get("required")],
+                   "optional": [_param_line(p) for p in params if not p.get("required")]}
+            ok = (op.get("responses") or {}).get("200") or {}
+            schema = ok.get("schema") or ((ok.get("content") or {}).get("application/json") or {}).get("schema")
+            fields: list = []
+            _leaf_fields(schema, defs, fields)
+            if fields:
+                row["response_fields"] = fields[:SPEC_MAX_FIELDS]
+                if len(fields) > SPEC_MAX_FIELDS:
+                    row["response_fields"].append(f"…외 {len(fields) - SPEC_MAX_FIELDS}개")
+            ops.append(row)
+    if not ops:
+        return None
+    out = {"base_url": base, "operations": ops[:SPEC_MAX_OPS]}
+    if len(ops) > SPEC_MAX_OPS:
+        out["operations_omitted"] = len(ops) - SPEC_MAX_OPS
+    return out
+
+
+def _page_text(page: str) -> str:
+    page = re.sub(r"<(script|style)\b.*?</\1>", " ", page, flags=re.S | re.I)
+    return re.sub(r"\s+", " ", _html.unescape(re.sub(r"<[^>]+>", " ", page)))
+
+
+def _fetch_api_spec(landing: str, title: str) -> dict:
+    try:
+        r = requests.get(landing, headers=_UA, timeout=SPEC_TIMEOUT)
+    except requests.RequestException as e:
+        return {"status": "unreachable",
+                "note": f"원본 페이지에 자동으로 접속하지 못함({type(e).__name__}). 브라우저로는 열릴 수 있으니 landing_page를 사용자에게 안내."}
+    if r.status_code == 404:
+        return {"status": "not_found",
+                "note": "원본 페이지가 없어짐(404). 카탈로그가 옛 정보일 수 있으니 variants·related에서 다른 등록본을 찾는다."}
+    if r.status_code >= 400:
+        return {"status": "unreachable", "note": f"원본 페이지가 HTTP {r.status_code}로 응답함. landing_page를 사용자에게 안내."}
+    page = r.text
+
+    m = re.search(r"swaggerJson\s*=\s*`(.*?)`", page, re.S)
+    if m and m.group(1).strip():
+        for raw in (m.group(1), _js_template(m.group(1))):
+            try:
+                spec = _swagger_spec(json.loads(raw))
+            except ValueError:
+                continue
+            if spec:
+                return {"status": "swagger",
+                        "note": "원본 페이지에 실린 API 명세(Swagger)에서 뽑음. 호출 주소 = base_url + path, 인증키는 별도로 붙인다.",
+                        **spec}
+            break
+
+    text = _page_text(page)
+    if urlparse(landing).netloc.endswith("data.go.kr"):
+        endpoints = sorted(set(re.findall(r"https?://apis\.data\.go\.kr/[\w./-]+", text)))
+        if "요청주소" in text and endpoints:
+            return {"status": "html", "endpoints": endpoints[:SPEC_MAX_OPS],
+                    "note": "명세 파일은 없고 요청주소만 뽑음. 요청변수·출력 항목은 landing_page 본문의 '상세기능' 표(오퍼레이션별 탭)에 있다."}
+        if re.search(r"API\s*유형\s*LINK", text):
+            return {"status": "link",
+                    "note": "공공데이터포털에는 소개만 있고 실제 API는 제공기관 사이트에 있음(LINK형). 실제 주소·명세는 landing_page에서 "
+                            "활용신청 후 '바로가기'를 눌러야 나온다. 같은 데이터가 다른 포털(예: 브이월드)에도 등록돼 있으면 variants·related에서 찾는다."}
+        return {"status": "unknown", "note": "공공데이터포털 페이지지만 명세 위치를 알아보지 못함. landing_page를 직접 확인."}
+
+    # 제목이 본문에 없으면 내용을 자바스크립트로 채우는 페이지다. 요청변수 표 머리글만 있고 값이 빈 경우(도로공사·교통빅데이터)도 여기 걸린다.
+    # 길이로 판단하지 않는다: 철도산업정보센터는 1,500자 남짓이어도 명세가 다 들어 있다.
+    core = _norm(_VARIANT_TAGS.sub("", (title or "").split("_")[-1] if "_" in (title or "") else title or ""))
+    if not core or core not in _norm(text):
+        return {"status": "no_content",
+                "note": "이 포털은 내용을 자바스크립트로 그려서 자동으로 열면 빈 화면만 온다. 명세는 사용자가 브라우저로 landing_page를 열어 확인해야 한다."}
+    if re.search(r"요청\s*변수|요청\s*인자|요청\s*파라미터|샘플\s*(URL|데이터|코드)", text):
+        out = {"status": "html",
+               "note": "명세가 landing_page 본문에 있음(요청변수·샘플 표). 포털마다 형식이 달라 요청 주소 말고는 자동으로 뽑지 않았다."}
+        endpoints = sorted(set(re.findall(r"(?:요청\s*(?:URL|주소)|서비스\s*URL)\s*:?\s*(https?://[^\s?<>\"']+)", text)))
+        if endpoints:
+            out["endpoints"] = endpoints[:SPEC_MAX_OPS]
+        return out
+    return {"status": "elsewhere",
+            "note": "명세가 이 페이지 본문에는 없음. 포털의 'Open API'·'명세' 탭이나 별도 문서에서 확인해야 한다."}
+
+
+def _api_spec(landing: str, title: str) -> dict:
+    """Open API형의 원본 페이지를 열어 명세를 뽑거나, 못 뽑으면 이유(status·note)를 준다. 같은 페이지는 1시간 동안 다시 받지 않는다."""
+    if not landing:
+        return {"status": "no_page", "note": "명세를 볼 원본 페이지가 등록돼 있지 않음."}
+    hit = _SPEC_CACHE.get(landing)
+    if hit and time.time() - hit[0] < SPEC_TTL:
+        return hit[1]
+    out = _fetch_api_spec(landing, title)
+    if out["status"] != "unreachable":      # 일시적인 접속 실패는 기억하지 않는다
+        _SPEC_CACHE[landing] = (time.time(), out)
+    return out
+
+
+def _api_how(portal: str, rights, spec: dict) -> str:
+    # rights는 공공데이터포털에선 '개발단계 : 자동승인 / …'이지만 다른 포털에선 저작권 문구가 들어 있다. 승인 정보일 때만 붙인다.
+    approval = f" (승인 방식: {rights})" if rights and "승인" in str(rights) else ""
+    if spec["status"] in ("swagger", "html") and (spec.get("base_url") or spec.get("endpoints")):
+        return (f"Open API다. 파일이 아니라 호출해서 받는다. '{portal}'에서 활용신청해 인증키를 받은 뒤 api_spec대로 호출한다{approval}. "
+                "활용신청·인증키 발급은 사용자가 직접 해야 하고, 인증키 없이 부르면 실패한다.")
+    if spec["status"] == "html":
+        return (f"Open API다. '{portal}'의 landing_page 본문에 명세가 있다(api_spec.note). "
+                f"활용신청·인증키 발급은 사용자가 직접 해야 한다{approval}.")
+    return (f"Open API다. 명세를 자동으로 확인하지 못했다(api_spec.status·note 참고). "
+            f"'{portal}'의 landing_page에서 활용신청과 명세 확인을 하도록 사용자에게 안내한다{approval}.")
 
 
 @mcp.tool()
@@ -526,10 +760,14 @@ def get_detail(
     돌려주는 것: 원본 포털 이름·주소, 파일 목록(제목·형식·크기·수정일·주소), 저작권, how_to_get(받는 방법),
     related(사이트가 꼽은 유사 데이터: 같은 데이터의 다른 집계 단위·다른 등록본·함께 쓸 만한 데이터).
     파일 '내용'은 주지 않는다. 대부분 파일은 제공기관 포털에 있고, 그 포털이 로그인·설문을 요구하면 사용자에게 안내한다.
+    Open API형이면 api_spec이 붙는다. status가 swagger면 호출 주소(base_url+path)·필수/선택 파라미터·응답 필드가 들어 있어
+    어떤 조건으로 무엇을 조회할 수 있는지 판단할 수 있다. 그 밖의 status(html·link·no_content·elsewhere·not_found·unreachable)는
+    명세를 자동으로 못 뽑은 것이니 note대로 안내하고, 파라미터·코드값을 짐작해서 채우지 않는다. 인증키는 사용자가 활용신청으로 받아야 한다.
 
     urls=[...]를 쓰면 한 항목이어도 {count, items:[...]}로 돌려준다. 기존 url은 한 항목이면 단일 상세 응답을 유지한다.
-    답변에서 받는 방법을 말할 데이터는 검색 결과 설명만 믿지 말고 전부 여기서 확인한다 (urls로 한 번에).
-    related·variants도 각각 상세를 확인한다. 다른 등록본·집계 단위의 받는 방법·저작권·기간을 그대로 적용하지 않는다.
+    답변에서 추천하거나 받는 방법을 안내할 데이터는 검색 결과 설명만 믿지 말고 여기서 확인한다 (urls로 한 번에).
+    related·variants는 전부 열 필요 없다. 그중 추천·안내할 것만 확인하고, 다른 등록본·집계 단위의 받는 방법·저작권·기간을 그대로 적용하지 않는다.
+    related의 relationship이 '같은 데이터의 다른 집계 단위'면, 원하는 단위·기간이 없다고 결론 내기 전에 그 항목을 확인한다.
     """
     if url is not None and urls is not None:
         return {"error": "url과 urls는 동시에 지정할 수 없음. 여러 후보는 urls에 모아 주세요."}
@@ -538,6 +776,8 @@ def get_detail(
         return {"error": "url 또는 urls가 비어 있음. search_data 결과의 url을 넣어 주세요."}
     if urls is None and len(inputs) == 1:
         out = _detail_one(inputs[0])
+        if out.get("related"):
+            out["related_hint"] = RELATED_HINT
         out["batch_hint"] = f"추가 후보가 있으면 get_detail의 urls 인자에 리스트로 모아 한 번에 조회(최대 {DETAIL_MAX}개)."
         return out
     items = []
@@ -546,7 +786,10 @@ def get_detail(
             items.append(_detail_one(u))
         except Exception as e:  # noqa: BLE001  하나가 실패해도 나머지는 돌려줌
             items.append({"input": u, "error": f"{type(e).__name__}: {_mask(e)}"})
-    out = {"count": len(items), "items": items}
+    out = {"count": len(items)}
+    if any(it.get("related") for it in items):
+        out["related_hint"] = RELATED_HINT      # 항목마다 반복하지 않고 맨 위에 한 번
+    out["items"] = items
     if len(inputs) > DETAIL_MAX:
         out["notice"] = f"한 번에 {DETAIL_MAX}개까지만 봄. 나머지 {len(inputs) - DETAIL_MAX}개는 다시 호출."
     return out
@@ -581,8 +824,13 @@ def _detail_one(url: str) -> dict:
     landing = resource.get("landingPage")
     portal = system.get("sysNm") or agent.get("agentName")
     direct = [f for f in files if f["download_url"]]
+    spec = None
+    if resource.get("type") == "dataservice":
+        spec = _api_spec(landing, resource.get("title"))
     if direct:
         how = "files의 download_url로 바로 받을 수 있음"
+    elif spec is not None:
+        how = _api_how(portal, resource.get("rights"), spec)
     elif files and landing:
         how = (f"파일 {len(files)}개가 '{portal}'에 있음. landing_page(또는 각 파일의 page_url)에서 받아야 함. "
                "로그인·활용신청·이용 설문을 요구할 수 있으니 사용자에게 안내할 것.")
@@ -607,12 +855,11 @@ def _detail_one(url: str) -> dict:
         "how_to_get": how,
         "url": _detail_url(seq),
     }
+    if spec is not None:
+        out["api_spec"] = spec
     related = _related(res, seq)
     if related:
         out["related"] = related
-        out["related_hint"] = ("related는 미검증 후보 목록이다. kind가 미확인이면 상세의 type으로 확인한다. "
-                               "유사도 100도 동일성을 보장하지 않으며 다른 등록본은 받는 방법·라이선스·기간이 다를 수 있다. "
-                               "추천에 사용할 후보는 urls로 묶어 상세 조회하고, 결합할 데이터는 기간·집계 단위가 맞는지 확인한다.")
     return out
 
 
@@ -660,7 +907,8 @@ def contest_ideas(theme: str) -> str:
 1. search_data로 '{theme}'와 관련 단어들을 한 단어씩 검색해 후보 데이터를 넓게 모아.
    결과에 나온 키워드를 다음 검색어로 써서 최소 5번 이상 넓혀가.
 2. 서로 엮을 수 있어 보이는 데이터는 get_detail의 urls 인자에 리스트를 한 번에 넣어 파일 목록·받는 곳·저작권을 확인해.
-   응답의 related·variants에 다른 집계 단위나 등록본이 있으면 후보에 넣고, 사용할 후보는 각각 상세를 확인해.
+   응답의 related·variants에 다른 집계 단위나 등록본이 있으면 후보에 넣고, 사용할 후보만 상세를 확인해.
+   찾은 데이터의 단위·기간이 안 맞으면 없다고 단정하기 전에 related의 '같은 데이터의 다른 집계 단위'를 확인해.
    다른 항목의 다운로드 방법·라이선스·기간을 그대로 적용하지 마. 자동승인이어도 활용신청 등 how_to_get의 절차를 안내해.
    (list_analysis_datasets는 별개의 작은 목록이라 검색 결과의 상세 확인에는 쓸 수 없음)
 3. 데이터 2~3개를 조합한 아이디어 3개를 제안해. 각 아이디어마다:
